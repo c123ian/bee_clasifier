@@ -7,6 +7,7 @@ import json
 import base64
 import requests
 from typing import Optional, Dict, Any, List
+from collections import Counter
 
 from fasthtml.common import *
 from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
@@ -21,7 +22,7 @@ DB_PATH = "/data/bee_classifier.db"
 STATUS_DIR = "/data/status"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -160,6 +161,118 @@ def setup_database(db_path: str):
     
     conn.commit()
     return conn
+
+# Get classification statistics for dashboard
+def get_classification_stats():
+    """Query the database to get statistics about insect classifications"""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # Get overall counts by category from single results
+        cursor.execute("""
+            SELECT category, COUNT(*) as count 
+            FROM results 
+            GROUP BY category 
+            ORDER BY count DESC
+        """)
+        category_counts = cursor.fetchall()
+        
+        # Get total classifications
+        cursor.execute("SELECT COUNT(*) FROM results")
+        total_single = cursor.fetchone()[0] or 0
+        
+        # Get batch results count
+        cursor.execute("SELECT SUM(result_count) FROM batch_results")
+        total_batch_result = cursor.fetchone()[0]
+        total_batch = total_batch_result if total_batch_result is not None else 0
+        
+        # Get confidence levels distribution
+        cursor.execute("""
+            SELECT confidence, COUNT(*) as count 
+            FROM results 
+            GROUP BY confidence 
+            ORDER BY count DESC
+        """)
+        confidence_counts = cursor.fetchall()
+        
+        # Get recent classifications (last 10)
+        cursor.execute("""
+            SELECT id, category, confidence, created_at 
+            FROM results 
+            ORDER BY created_at DESC 
+            LIMIT 10
+        """)
+        recent_classifications = cursor.fetchall()
+        
+        # Get statistics from batch results
+        batch_categories = Counter()
+        
+        cursor.execute("SELECT results FROM batch_results ORDER BY created_at DESC LIMIT 50")
+        batch_results = cursor.fetchall()
+        
+        for batch in batch_results:
+            if batch[0]:
+                try:
+                    results_data = json.loads(batch[0])
+                    for item in results_data:
+                        category = item.get('category', 'Unknown')
+                        batch_categories[category] += 1
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    continue
+        
+        # Combine single and batch category statistics
+        combined_categories = {}
+        for category, count in category_counts:
+            combined_categories[category] = count
+        
+        for category, count in batch_categories.items():
+            if category in combined_categories:
+                combined_categories[category] += count
+            else:
+                combined_categories[category] = count
+                
+        # Create combined category counts list
+        combined_category_counts = [(category, count) for category, count in combined_categories.items()]
+        combined_category_counts.sort(key=lambda x: x[1], reverse=True)
+        
+        # Get count of classifications by date
+        cursor.execute("""
+            SELECT DATE(created_at) as date, COUNT(*) as count 
+            FROM results 
+            GROUP BY DATE(created_at) 
+            ORDER BY date DESC 
+            LIMIT 14
+        """)
+        daily_counts = cursor.fetchall()
+        
+        conn.close()
+        
+        return {
+            "category_counts": category_counts,
+            "combined_category_counts": combined_category_counts,
+            "confidence_counts": confidence_counts,
+            "recent_classifications": recent_classifications,
+            "daily_counts": daily_counts,
+            "total_single": total_single,
+            "total_batch": total_batch,
+            "total": total_single + total_batch
+        }
+        
+    except Exception as e:
+        print(f"Error getting classification stats: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "category_counts": [],
+            "combined_category_counts": [],
+            "confidence_counts": [],
+            "recent_classifications": [],
+            "daily_counts": [],
+            "total_single": 0,
+            "total_batch": 0,
+            "total": 0
+        }
 
 # Generate classification using Claude's API for a single image
 @app.function(
@@ -804,6 +917,28 @@ def serve():
             cls="w-full md:w-1/2 bg-base-100 p-6 rounded-lg shadow-lg custom-border border"
         )
         
+        # Navigation bar
+        navbar = Div(
+            Div(
+                A(
+                    Span("🐝", cls="text-xl"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    href="/",
+                    cls="flex items-center"
+                ),
+                Div(
+                    A(
+                        "Dashboard",
+                        href="/dashboard",
+                        cls="btn btn-sm btn-ghost"
+                    ),
+                    cls="flex-none"
+                ),
+                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
+            ),
+            cls="w-full"
+        )
+        
         # Add script for unified form handling
         form_script = Script("""
         document.addEventListener('DOMContentLoaded', function() {
@@ -1399,6 +1534,7 @@ def serve():
             Div(
                 H1("Insect Classification App", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
                 P("Powered by Claude's Vision AI", cls="text-center mb-8 text-base-content/70"),
+                navbar,  # Add the navbar here
                 Div(
                     control_panel,
                     results_panel,
@@ -1409,6 +1545,468 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
+    
+    #################################################
+    # Dashboard Route - Insect Statistics Dashboard
+    #################################################
+    @rt("/dashboard")
+    def dashboard():
+        """Render the insect classification dashboard"""
+        
+        # Get statistics data
+        stats = get_classification_stats()
+        
+        # Format category counts for React component
+        category_data = []
+        for category, count in stats["combined_category_counts"]:
+            category_data.append({"name": category, "value": count})
+        
+        # Format daily counts for the line chart
+        daily_data = []
+        for date, count in stats["daily_counts"]:
+            daily_data.append({"date": date, "count": count})
+        daily_data.reverse()  # Show oldest to newest for the line chart
+        
+        # Format confidence data for the donut chart
+        confidence_data = []
+        for confidence, count in stats["confidence_counts"]:
+            confidence_data.append({"name": confidence, "value": count})
+        
+        # Helper function for confidence classes - MOVED UP HERE before it's used
+        def get_confidence_class(confidence):
+            if confidence == 'High':
+                return 'confidence-high'
+            elif confidence == 'Low':
+                return 'confidence-low'
+            return 'confidence-medium'
+        
+        # Create the dashboard HTML
+        dashboard_stats = Div(
+            H2("Classification Statistics", cls="text-2xl font-bold mb-6 text-bee-green"),
+            
+            Div(
+                Div(
+                    Div(
+                        H3("Total Classifications", cls="text-lg font-medium text-base-content/70"),
+                        Div(
+                            Span(f"{stats['total']:,}", cls="text-4xl font-bold text-primary"),
+                            cls="mt-2"
+                        ),
+                        cls="p-4 bg-base-200 rounded-lg"
+                    ),
+                    cls="w-full md:w-1/3"
+                ),
+                
+                Div(
+                    Div(
+                        H3("Single Images", cls="text-lg font-medium text-base-content/70"),
+                        Div(
+                            Span(f"{stats['total_single']:,}", cls="text-4xl font-bold text-secondary"),
+                            cls="mt-2"
+                        ),
+                        cls="p-4 bg-base-200 rounded-lg"
+                    ),
+                    cls="w-full md:w-1/3"
+                ),
+                
+                Div(
+                    Div(
+                        H3("Batch Images", cls="text-lg font-medium text-base-content/70"),
+                        Div(
+                            Span(f"{stats['total_batch']:,}", cls="text-4xl font-bold text-accent"),
+                            cls="mt-2"
+                        ),
+                        cls="p-4 bg-base-200 rounded-lg"
+                    ),
+                    cls="w-full md:w-1/3"
+                ),
+                
+                cls="flex flex-col md:flex-row gap-4 mb-6"
+            ),
+            
+            Div(
+                Div(
+                    H3("Insect Diversity", cls="text-xl font-semibold mb-4 text-bee-green"),
+                    Div(
+                        id="insect-diversity-chart",
+                        cls="h-72"
+                    ),
+                    cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border mb-6"
+                ),
+                cls="w-full"
+            ),
+            
+            Div(
+                Div(
+                    H3("Confidence Levels", cls="text-xl font-semibold mb-4 text-bee-green"),
+                    Div(
+                        id="confidence-chart",
+                        cls="h-72"
+                    ),
+                    cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border"
+                ),
+                
+                Div(
+                    H3("Classifications Over Time", cls="text-xl font-semibold mb-4 text-bee-green"),
+                    Div(
+                        id="time-series-chart",
+                        cls="h-72"
+                    ),
+                    cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border"
+                ),
+                
+                cls="flex flex-col md:flex-row gap-6 mb-6"
+            ),
+            
+            Div(
+                H3("Recent Classifications", cls="text-xl font-semibold mb-4 text-bee-green"),
+                Table(
+                    Thead(
+                        Tr(
+                            Th("ID", cls="px-4 py-2"),
+                            Th("Category", cls="px-4 py-2"),
+                            Th("Confidence", cls="px-4 py-2"),
+                            Th("Date", cls="px-4 py-2")
+                        ),
+                        cls="bg-base-200"
+                    ),
+                    Tbody(
+                        *[
+                            Tr(
+                                Td(Id[:8] + "...", cls="px-4 py-2 text-sm"),
+                                Td(Category, cls="px-4 py-2"),
+                                Td(
+                                    Span(
+                                        Confidence, 
+                                        cls=f"badge {get_confidence_class(Confidence)}"
+                                    ),
+                                    cls="px-4 py-2"
+                                ),
+                                Td(Date.split()[0], cls="px-4 py-2 text-sm"),
+                                cls="border-b border-base-200 hover:bg-base-200"
+                            )
+                            for Id, Category, Confidence, Date in stats["recent_classifications"]
+                        ] if stats["recent_classifications"] else [
+                            Tr(
+                                Td("No recent classifications found", cls="px-4 py-2 text-center font-italic", colspan="4")
+                            )
+                        ],
+                        cls=""
+                    ),
+                    cls="table w-full"
+                ),
+                cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border mb-6"
+            ),
+            
+            Div(
+                A(
+                    "Back to Classifier",
+                    href="/",
+                    cls="btn btn-primary"
+                ),
+                cls="mt-6"
+            ),
+            
+            cls="container mx-auto px-4 max-w-6xl"
+        )
+        
+        # Add visualization React components
+        visualization_script = Script(f"""
+        // Helper function for confidence classes
+        function getConfidenceClass(confidence) {{
+            if (confidence === 'High') return 'confidence-high';
+            if (confidence === 'Low') return 'confidence-low';
+            return 'confidence-medium';
+        }}
+        
+        // Category data for the pie chart
+        const categoryData = {json.dumps(category_data)};
+        
+        // Daily data for line chart
+        const dailyData = {json.dumps(daily_data)};
+        
+        // Confidence data for donut chart
+        const confidenceData = {json.dumps(confidence_data)};
+        
+        // Color scheme for charts
+        const COLORS = [
+            '#4caf50', '#8bc34a', '#cddc39', 
+            '#ffc107', '#ff9800', '#ff5722',
+            '#f44336', '#e91e63', '#9c27b0', 
+            '#673ab7'
+        ];
+        
+        // Confidence level colors
+        const CONFIDENCE_COLORS = {{
+            'High': '#4caf50',
+            'Medium': '#ffc107',
+            'Low': '#f44336'
+        }};
+        
+        // Render the insect diversity pie chart
+        function renderInsectDiversityChart() {{
+            const container = document.getElementById('insect-diversity-chart');
+            if (!container || categoryData.length === 0) return;
+            
+            // Create SVG
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            const radius = Math.min(width, height) / 2 * 0.8;
+            
+            const svg = d3.select(container)
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height)
+                .append('g')
+                .attr('transform', `translate(${{width / 2}},${{height / 2}})`);
+            
+            // Compute the total
+            const total = categoryData.reduce((sum, entry) => sum + entry.value, 0);
+            
+            // Create pie layout
+            const pie = d3.pie()
+                .sort(null)
+                .value(d => d.value);
+            
+            const data_ready = pie(categoryData);
+            
+            // Create arcs
+            const arc = d3.arc()
+                .innerRadius(0)
+                .outerRadius(radius);
+            
+            const outerArc = d3.arc()
+                .innerRadius(radius * 0.9)
+                .outerRadius(radius * 0.9);
+            
+            // Add the arcs
+            svg.selectAll('allSlices')
+                .data(data_ready)
+                .enter()
+                .append('path')
+                .attr('d', arc)
+                .attr('fill', (d, i) => COLORS[i % COLORS.length])
+                .attr('stroke', 'white')
+                .style('stroke-width', '2px')
+                .style('opacity', 0.7);
+            
+            // Add labels
+            svg.selectAll('allLabels')
+                .data(data_ready)
+                .enter()
+                .append('text')
+                .text(d => {{
+                    // Only show label if it's a significant slice (>3% of total)
+                    const percent = (d.data.value / total * 100).toFixed(1);
+                    if (percent < 3) return '';
+                    return `${{d.data.name}} (${{percent}}%)`;
+                }})
+                .attr('transform', d => {{
+                    const pos = outerArc.centroid(d);
+                    const midangle = d.startAngle + (d.endAngle - d.startAngle) / 2;
+                    pos[0] = radius * 0.99 * (midangle < Math.PI ? 1 : -1);
+                    return `translate(${{pos[0]}}, ${{pos[1]}})`;
+                }})
+                .style('text-anchor', d => {{
+                    const midangle = d.startAngle + (d.endAngle - d.startAngle) / 2;
+                    return (midangle < Math.PI ? 'start' : 'end');
+                }})
+                .style('font-size', '12px');
+            
+            // Add lines
+            svg.selectAll('allPolylines')
+                .data(data_ready)
+                .enter()
+                .append('polyline')
+                .attr('points', d => {{
+                    const posA = arc.centroid(d);
+                    const posB = outerArc.centroid(d);
+                    const posC = outerArc.centroid(d);
+                    const midangle = d.startAngle + (d.endAngle - d.startAngle) / 2;
+                    posC[0] = radius * 0.95 * (midangle < Math.PI ? 1 : -1);
+                    
+                    // Only show lines for slices with labels (>3% of total)
+                    const percent = (d.data.value / total * 100).toFixed(1);
+                    if (percent < 3) return '';
+                    
+                    return [posA, posB, posC];
+                }})
+                .style('fill', 'none')
+                .style('stroke', 'gray')
+                .style('stroke-width', 1);
+        }}
+        
+        // Render the time series chart
+        function renderTimeSeriesChart() {{
+            const container = document.getElementById('time-series-chart');
+            if (!container || dailyData.length === 0) return;
+            
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            const margin = {{top: 20, right: 30, bottom: 40, left: 50}};
+            const innerWidth = width - margin.left - margin.right;
+            const innerHeight = height - margin.top - margin.bottom;
+            
+            const svg = d3.select(container)
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height)
+                .append('g')
+                .attr('transform', `translate(${{margin.left}},${{margin.top}})`);
+            
+            // Create scales
+            const x = d3.scaleBand()
+                .domain(dailyData.map(d => d.date))
+                .range([0, innerWidth])
+                .padding(0.1);
+            
+            const y = d3.scaleLinear()
+                .domain([0, d3.max(dailyData, d => d.count) * 1.1])
+                .range([innerHeight, 0]);
+            
+            // Add the x-axis
+            svg.append('g')
+                .attr('transform', `translate(0,${{innerHeight}}`)
+                .call(d3.axisBottom(x))
+                .selectAll("text")
+                .attr("y", 10)
+                .attr("x", -5)
+                .attr("dy", ".35em")
+                .attr("transform", "rotate(-45)")
+                .style("text-anchor", "end");
+            
+            // Add the y-axis
+            svg.append('g')
+                .call(d3.axisLeft(y));
+            
+            // Add the line
+            svg.append('path')
+                .datum(dailyData)
+                .attr('fill', 'none')
+                .attr('stroke', '#4caf50')
+                .attr('stroke-width', 2)
+                .attr('d', d3.line()
+                    .x(d => x(d.date) + x.bandwidth() / 2)
+                    .y(d => y(d.count))
+                );
+            
+            // Add circles
+            svg.selectAll('circle')
+                .data(dailyData)
+                .enter()
+                .append('circle')
+                .attr('cx', d => x(d.date) + x.bandwidth() / 2)
+                .attr('cy', d => y(d.count))
+                .attr('r', 5)
+                .attr('fill', '#4caf50')
+                .attr('stroke', 'white')
+                .attr('stroke-width', 2);
+            
+            // Add labels
+            svg.selectAll('text.value')
+                .data(dailyData)
+                .enter()
+                .append('text')
+                .attr('x', d => x(d.date) + x.bandwidth() / 2)
+                .attr('y', d => y(d.count) - 10)
+                .attr('text-anchor', 'middle')
+                .text(d => d.count)
+                .style('font-size', '10px');
+        }}
+        
+        // Render the confidence donut chart
+        function renderConfidenceChart() {{
+            const container = document.getElementById('confidence-chart');
+            if (!container || confidenceData.length === 0) return;
+            
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            const radius = Math.min(width, height) / 2 * 0.8;
+            
+            const svg = d3.select(container)
+                .append('svg')
+                .attr('width', width)
+                .attr('height', height)
+                .append('g')
+                .attr('transform', `translate(${{width / 2}},${{height / 2}})`);
+            
+            // Compute the total
+            const total = confidenceData.reduce((sum, entry) => sum + entry.value, 0);
+            
+            // Create pie layout
+            const pie = d3.pie()
+                .sort(null)
+                .value(d => d.value);
+            
+            const data_ready = pie(confidenceData);
+            
+            // Create arcs
+            const arc = d3.arc()
+                .innerRadius(radius * 0.5)  // Donut hole
+                .outerRadius(radius);
+            
+            // Add the arcs
+            svg.selectAll('allSlices')
+                .data(data_ready)
+                .enter()
+                .append('path')
+                .attr('d', arc)
+                .attr('fill', d => CONFIDENCE_COLORS[d.data.name] || '#999')
+                .attr('stroke', 'white')
+                .style('stroke-width', '2px')
+                .style('opacity', 0.8);
+            
+            // Add center text
+            svg.append('text')
+                .attr('text-anchor', 'middle')
+                .attr('dy', '0em')
+                .style('font-size', '16px')
+                .style('font-weight', 'bold')
+                .text('Confidence');
+            
+            svg.append('text')
+                .attr('text-anchor', 'middle')
+                .attr('dy', '1.5em')
+                .style('font-size', '14px')
+                .text(`Total: ${{total}}`);
+            
+            // Add labels
+            svg.selectAll('allLabels')
+                .data(data_ready)
+                .enter()
+                .append('text')
+                .text(d => `${{d.data.name}}: ${{d.data.value}} (${{(d.data.value / total * 100).toFixed(1)}}%)`)
+                .attr('transform', d => {{
+                    const pos = arc.centroid(d);
+                    pos[0] = pos[0] * 1.6;
+                    pos[1] = pos[1] * 1.6;
+                    return `translate(${{pos[0]}}, ${{pos[1]}})`;
+                }})
+                .style('text-anchor', 'middle')
+                .style('font-size', '12px');
+        }}
+        
+        // Initialize all charts once DOM is loaded
+        document.addEventListener('DOMContentLoaded', function() {{
+            renderInsectDiversityChart();
+            renderTimeSeriesChart();
+            renderConfidenceChart();
+        }});
+        """)
+        
+        return Title("Insect Classification Dashboard"), Main(
+            visualization_script,
+            Div(
+                H1("Insect Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
+                P("Statistics and visualizations of classification results", cls="text-center mb-8 text-base-content/70"),
+                dashboard_stats,
+                cls="py-8"
+            ),
+            Script(src="https://d3js.org/d3.v7.min.js"),  # Add D3.js for visualizations
+            cls="min-h-screen bg-base-100",
+            data_theme="light"
+        )
+    
     
     #################################################
     # Single Image Classify API Endpoint
