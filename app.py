@@ -42,7 +42,7 @@ PDF_IMAGES_DIR = "/data/pdf_images"
 HEATMAP_DIR = "/data/heatmaps"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -67,7 +67,7 @@ image = (
         "requests",
         "python-fasthtml==0.12.0",
         "torch",
-        "numpy",
+        "numpy==1.24.3",
         "pandas",
         "Pillow",
         "matplotlib",
@@ -1215,8 +1215,8 @@ def serve():
         
         # Add script for unified form handling
         form_script = Script("""
-        document.addEventListener('DOMContentLoaded', function() {
-            // Form elements
+                document.addEventListener('DOMContentLoaded', function() {
+            // Form elements - cache all DOM elements we'll need to reference
             const imageInput = document.getElementById('image-input');
             const singlePreview = document.getElementById('single-preview');
             const batchPreviewsContainer = document.getElementById('batch-previews');
@@ -1224,7 +1224,7 @@ def serve():
             const imageCountElem = document.getElementById('image-count');
             const classifyButton = document.getElementById('classify-button');
             
-            // Results elements
+            // Results elements - references to DOM elements for displaying results
             const loadingIndicator = document.getElementById('loading-indicator').parentElement;
             const resultsPlaceholder = document.getElementById('results-placeholder');
             const resultsContent = document.getElementById('results-content');
@@ -1234,13 +1234,29 @@ def serve():
             const copyButton = document.getElementById('copy-button');
             const newButton = document.getElementById('new-button');
             
-            // Mode tracking
+            // Mode tracking variables
             let isBatchMode = false;
             const MAX_IMAGES = 5;
             let selectedFiles = [];
             let rawResponseText = '';
             
-            // Get options from the form
+            // Debug elements on page load
+            console.log("DOM loaded - Bee Classifier Initialized");
+            console.log("Button state:", classifyButton ? (classifyButton.disabled ? "disabled" : "enabled") : "button not found");
+            
+            // Explicitly attach the change event listener
+            // This ensures the file input triggers our handler even if the HTML attribute binding fails
+            if (imageInput) {
+                console.log("Setting up file input change listener");
+                imageInput.addEventListener('change', function(event) {
+                    console.log("File input changed - files selected:", event.target.files.length);
+                    handleFileSelection(event);
+                });
+            } else {
+                console.error("Critical Error: Image input element not found");
+            }
+            
+            // Get options from the form controls
             function getOptions() {
                 return {
                     use_rag: document.querySelector('input[name="use_rag"]').checked,
@@ -1250,14 +1266,18 @@ def serve():
                 };
             }
             
-            // Handle file selection
+            // Handle file selection - core function that processes selected files
             window.handleFileSelection = function(event) {
+                console.log("handleFileSelection called");
                 const files = event.target.files;
                 
                 if (!files || files.length === 0) {
+                    console.log("No files selected");
                     resetForm();
                     return;
                 }
+                
+                console.log(`${files.length} files selected`);
                 
                 if (files.length > MAX_IMAGES) {
                     alert(`Please select a maximum of ${MAX_IMAGES} images.`);
@@ -1271,6 +1291,7 @@ def serve():
                 
                 if (isBatchMode) {
                     // Batch mode - show multiple previews
+                    console.log("Batch mode activated");
                     singlePreview.classList.add('hidden');
                     batchPreviewsContainer.classList.remove('hidden');
                     batchPreviewsContainer.innerHTML = '';
@@ -1325,15 +1346,24 @@ def serve():
                     countDisplay.classList.remove('hidden');
                 } else {
                     // Single mode - show one preview
+                    console.log("Single image mode activated");
                     showSinglePreview(selectedFiles[0]);
                 }
                 
-                // Enable classify button
-                classifyButton.disabled = false;
+                // Enable classify button - with visual feedback
+                if (classifyButton) {
+                    classifyButton.disabled = false;
+                    classifyButton.classList.remove('opacity-50');
+                    classifyButton.classList.add('hover:bg-primary-focus');
+                    console.log("Classify button enabled");
+                } else {
+                    console.error("Critical Error: Classify button not found");
+                }
             };
             
             // Show single image preview
             function showSinglePreview(file) {
+                console.log("Showing single preview for file:", file.name);
                 const reader = new FileReader();
                 
                 reader.onload = function(e) {
@@ -1348,6 +1378,7 @@ def serve():
             
             // Update batch previews
             function updateBatchPreviews() {
+                console.log("Updating batch previews, count:", selectedFiles.length);
                 batchPreviewsContainer.innerHTML = '';
                 
                 selectedFiles.forEach((file, index) => {
@@ -1399,39 +1430,56 @@ def serve():
                 countDisplay.classList.remove('hidden');
             }
             
-            // Reset the form
+            // Reset the form to initial state
             function resetForm() {
+                console.log("Resetting form");
                 imageInput.value = '';
                 singlePreview.src = '';
                 singlePreview.classList.add('hidden');
                 batchPreviewsContainer.innerHTML = '';
                 batchPreviewsContainer.classList.add('hidden');
                 countDisplay.classList.add('hidden');
-                classifyButton.disabled = true;
+                
+                // Reset button with visual indicators
+                if (classifyButton) {
+                    classifyButton.disabled = true;
+                    classifyButton.classList.add('opacity-50');
+                    classifyButton.classList.remove('hover:bg-primary-focus');
+                }
+                
                 selectedFiles = [];
                 isBatchMode = false;
             }
             
             // Handle classify button click
-            classifyButton.addEventListener('click', function() {
-                // Show loading state
-                loadingIndicator.classList.remove('hidden');
-                resultsPlaceholder.classList.add('hidden');
-                resultsContent.classList.add('hidden');
-                resultActions.classList.add('hidden');
-                classifyButton.disabled = true;
-                
-                if (isBatchMode) {
-                    // Batch mode - process multiple images
-                    processBatchImages();
-                } else {
-                    // Single mode - process one image
-                    processSingleImage();
-                }
-            });
+            if (classifyButton) {
+                classifyButton.addEventListener('click', function() {
+                    console.log("Classify button clicked");
+                    
+                    // Show loading state
+                    loadingIndicator.classList.remove('hidden');
+                    resultsPlaceholder.classList.add('hidden');
+                    resultsContent.classList.add('hidden');
+                    resultActions.classList.add('hidden');
+                    classifyButton.disabled = true;
+                    classifyButton.classList.add('opacity-50');
+                    
+                    if (isBatchMode) {
+                        // Batch mode - process multiple images
+                        console.log("Processing batch of", selectedFiles.length, "images");
+                        processBatchImages();
+                    } else {
+                        // Single mode - process one image
+                        console.log("Processing single image");
+                        processSingleImage();
+                    }
+                });
+            }
             
             // Process a single image
             function processSingleImage() {
+                console.log("Starting single image processing");
+                
                 // Get the base64 image data
                 const base64Data = singlePreview.src.split(',')[1];
                 
@@ -1446,12 +1494,16 @@ def serve():
                         options: getOptions()
                     })
                 })
-                .then(response => response.json())
+                .then(response => {
+                    console.log("Received API response, status:", response.status);
+                    return response.json();
+                })
                 .then(data => {
                     // Hide loading indicator
                     loadingIndicator.classList.add('hidden');
                     
                     if (data.error) {
+                        console.error("Error from API:", data.error);
                         // Show error message
                         singleResult.innerHTML = `
                             <div class="alert alert-error">
@@ -1463,6 +1515,8 @@ def serve():
                         resultsContent.classList.remove('hidden');
                         return;
                     }
+                    
+                    console.log("Classification successful, displaying results");
                     
                     // Display the result using the enhanced display function
                     displaySingleResult(data);
@@ -1485,33 +1539,43 @@ def serve():
                     batchResults.classList.add('hidden');
                     resultsContent.classList.remove('hidden');
                     classifyButton.disabled = false;
+                    classifyButton.classList.remove('opacity-50');
                 });
             }
             
             // Process batch of images
             function processBatchImages() {
+                console.log("Starting batch image processing");
+                
                 // Create form data for file upload
                 const formData = new FormData();
                 
                 // Add all files
                 selectedFiles.forEach((file, index) => {
                     formData.append(`image_${index}`, file);
+                    console.log(`Added image_${index} to form data:`, file.name);
                 });
                 
                 // Add options
-                formData.append('options', JSON.stringify(getOptions()));
+                const options = getOptions();
+                formData.append('options', JSON.stringify(options));
+                console.log("Added options to form data:", options);
                 
                 // Send batch request
                 fetch('/classify-batch', {
                     method: 'POST',
                     body: formData
                 })
-                .then(response => response.json())
+                .then(response => {
+                    console.log("Received batch API response, status:", response.status);
+                    return response.json();
+                })
                 .then(data => {
                     // Hide loading indicator
                     loadingIndicator.classList.add('hidden');
                     
                     if (data.error) {
+                        console.error("Error from batch API:", data.error);
                         // Show error message
                         batchResults.innerHTML = `
                             <div class="alert alert-error">
@@ -1523,6 +1587,8 @@ def serve():
                         resultsContent.classList.remove('hidden');
                         return;
                     }
+                    
+                    console.log("Batch classification successful, displaying results");
                     
                     // Save raw response for copy button
                     rawResponseText = data.raw_response;
@@ -1548,33 +1614,41 @@ def serve():
                     batchResults.classList.remove('hidden');
                     resultsContent.classList.remove('hidden');
                     classifyButton.disabled = false;
+                    classifyButton.classList.remove('opacity-50');
                 });
             }
             
             // Setup copy button
-            copyButton.addEventListener('click', function() {
-                navigator.clipboard.writeText(rawResponseText);
-                copyButton.innerHTML = 'Copied!';
-                setTimeout(() => {
-                    copyButton.innerHTML = 'Copy Results';
-                }, 2000);
-            });
+            if (copyButton) {
+                copyButton.addEventListener('click', function() {
+                    console.log("Copy button clicked");
+                    navigator.clipboard.writeText(rawResponseText);
+                    copyButton.innerHTML = 'Copied!';
+                    setTimeout(() => {
+                        copyButton.innerHTML = 'Copy Results';
+                    }, 2000);
+                });
+            }
             
             // Setup new button
-            newButton.addEventListener('click', function() {
-                // Reset form
-                resetForm();
-                
-                // Reset results
-                resultsPlaceholder.classList.remove('hidden');
-                resultsContent.classList.add('hidden');
-                resultActions.classList.add('hidden');
-                singleResult.classList.add('hidden');
-                batchResults.classList.add('hidden');
-            });
+            if (newButton) {
+                newButton.addEventListener('click', function() {
+                    console.log("New classification button clicked");
+                    // Reset form
+                    resetForm();
+                    
+                    // Reset results
+                    resultsPlaceholder.classList.remove('hidden');
+                    resultsContent.classList.add('hidden');
+                    resultActions.classList.add('hidden');
+                    singleResult.classList.add('hidden');
+                    batchResults.classList.add('hidden');
+                });
+            }
             
             // Function to display single classification result with context
             function displaySingleResult(result) {
+                console.log("Displaying single result:", result.category);
                 const singleResult = document.getElementById('single-result');
                 
                 // Determine confidence class
@@ -1674,6 +1748,7 @@ def serve():
             
             // Function to display batch results with context
             function displayBatchResults(batchResult) {
+                console.log("Displaying batch results for", batchResult.results.length, "images");
                 const batchResultsContainer = document.getElementById('batch-results');
                 
                 // Create results header
@@ -1810,6 +1885,7 @@ def serve():
                 
                 // Setup carousel navigation if needed
                 if (batchResult.results.length > 1) {
+                    console.log("Setting up carousel for", batchResult.results.length, "items");
                     const carouselItems = document.getElementById('carousel-items');
                     const prevBtn = document.getElementById('prev-btn');
                     const nextBtn = document.getElementById('next-btn');
@@ -1824,6 +1900,7 @@ def serve():
                         if (index >= batchResult.results.length) index = 0;
                         
                         currentIndex = index;
+                        console.log("Showing slide", index);
                         
                         // Update transform
                         carouselItems.style.transform = `translateX(-${index * 100}%)`;
@@ -1839,8 +1916,8 @@ def serve():
                     }
                     
                     // Add event listeners
-                    prevBtn.addEventListener('click', () => showSlide(currentIndex - 1));
-                    nextBtn.addEventListener('click', () => showSlide(currentIndex + 1));
+                    if (prevBtn) prevBtn.addEventListener('click', () => showSlide(currentIndex - 1));
+                    if (nextBtn) nextBtn.addEventListener('click', () => showSlide(currentIndex + 1));
                     
                     // Add indicator click handlers
                     indicators.forEach((indicator, i) => {
@@ -1854,10 +1931,17 @@ def serve():
             
             // Global function for providing feedback
             window.provideFeedback = function(resultId, feedbackType, upButtonId, downButtonId, messageId) {
+                console.log("Providing feedback:", feedbackType, "for result:", resultId);
+                
                 // Get button elements
                 const upButton = document.getElementById(upButtonId || 'thumbs-up-button');
                 const downButton = document.getElementById(downButtonId || 'thumbs-down-button');
                 const messageElement = document.getElementById(messageId || 'feedback-message');
+                
+                if (!upButton || !downButton) {
+                    console.error("Feedback buttons not found");
+                    return;
+                }
                 
                 // Update button UI state
                 if (feedbackType === 'positive') {
@@ -1869,7 +1953,9 @@ def serve():
                 }
                 
                 // Show sending message
-                messageElement.textContent = 'Saving feedback...';
+                if (messageElement) {
+                    messageElement.textContent = 'Saving feedback...';
+                }
                 
                 // Send feedback to server
                 fetch('/api/feedback', {
@@ -1890,22 +1976,58 @@ def serve():
                 })
                 .then(data => {
                     console.log('Feedback saved successfully:', data);
-                    messageElement.textContent = 'Feedback saved!';
-                    
-                    // Clear message after a delay
-                    setTimeout(() => {
-                        messageElement.textContent = '';
-                    }, 3000);
+                    if (messageElement) {
+                        messageElement.textContent = 'Feedback saved!';
+                        
+                        // Clear message after a delay
+                        setTimeout(() => {
+                            messageElement.textContent = '';
+                        }, 3000);
+                    }
                 })
                 .catch(error => {
                     console.error('Error saving feedback:', error);
-                    messageElement.textContent = 'Error saving feedback.';
+                    if (messageElement) {
+                        messageElement.textContent = 'Error saving feedback.';
+                    }
                     
                     // Reset buttons 
                     upButton.classList.remove('btn-success', 'btn-active');
                     downButton.classList.remove('btn-error', 'btn-active');
                 });
             };
+        });
+
+        // Additional CSS styles for better button states
+        document.addEventListener('DOMContentLoaded', function() {
+            // Create and add a style element for custom button styles
+            const styleElement = document.createElement('style');
+            styleElement.textContent = `
+                /* Button state styles */
+                .btn:disabled {
+                    opacity: 0.5 !important;
+                    cursor: not-allowed !important;
+                    pointer-events: none !important;
+                }
+                
+                .btn:not(:disabled) {
+                    cursor: pointer !important;
+                    opacity: 1 !important;
+                }
+                
+                /* Add a visible hover effect for enabled buttons */
+                .btn:not(:disabled):hover {
+                    filter: brightness(1.1);
+                    transform: translateY(-1px);
+                    transition: all 0.2s ease;
+                }
+                
+                /* Add more obvious active state */
+                .btn:not(:disabled):active {
+                    transform: translateY(1px);
+                }
+            `;
+            document.head.appendChild(styleElement);
         });
         """)
         
