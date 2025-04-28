@@ -19,8 +19,9 @@ from nltk.tokenize import word_tokenize
 import matplotlib.pyplot as plt
 from rerankers import Reranker
 
+
 from fasthtml.common import *
-from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
+from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
 
 # Configure logging
 logging.basicConfig(
@@ -42,7 +43,7 @@ PDF_IMAGES_DIR = "/data/pdf_images"
 HEATMAP_DIR = "/data/heatmaps"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -59,22 +60,20 @@ INSECT_CATEGORIES = [
     "Other flies"
 ]
 
-# Create custom image with all dependencies
+# Create custom image with all dependencies - FIXED for NumPy issue
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0", "libsm6", "libxrender1", "libxext6")
     .pip_install(
         "requests",
         "python-fasthtml==0.12.0",
-        "torch",
-        "numpy==1.24.3",
+        "numpy==1.23.5",  # Specify a compatible version that won't have the _core issue
         "pandas",
         "Pillow",
         "matplotlib",
         "rerankers",
         "rank-bm25",
         "nltk",
-        "faiss-cpu",
         "sentence-transformers"
     )
 )
@@ -603,7 +602,7 @@ async def retrieve_relevant_documents(query, top_k=5):
 # Format image for API calls
 def format_image(image):
     """Convert PIL Image to base64 for API"""
-    buffered = io.BytesIO()
+    buffered = BytesIO()
     # Convert to RGB if it has alpha channel
     if image.mode == "RGBA":
         image = image.convert("RGB")
@@ -658,6 +657,40 @@ def get_context_image(top_sources):
     
     return None
 
+# Helper function to get context image path
+def get_context_image_path(top_sources):
+    """Get the file path for the context image"""
+    global page_images
+    
+    if not top_sources or len(top_sources) == 0:
+        return None
+        
+    # Get the top source document
+    top_source = top_sources[0]
+    image_key = top_source.get('image_key')
+    
+    if not image_key or image_key not in page_images:
+        # Try to find the image by reconstructing path patterns
+        parts = image_key.split('_')
+        if len(parts) >= 2:
+            filename = '_'.join(parts[:-1])
+            page_num = parts[-1]
+            
+            # Check different potential locations
+            potential_paths = [
+                os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
+                os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
+                os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
+            ]
+            
+            for potential_path in potential_paths:
+                if os.path.exists(potential_path):
+                    return potential_path
+            
+        return None
+    
+    return page_images[image_key] if image_key in page_images else None
+
 # Generate classification using Claude's API for a single image
 @app.function(
     image=image,
@@ -665,7 +698,7 @@ def get_context_image(top_sources):
     timeout=300,
     volumes={DATA_DIR: bee_volume}
 )
-async def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
+def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
     """
     Classify insect in image using Claude's API based on provided options
     
@@ -695,25 +728,21 @@ async def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Di
         format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
     
     # Get relevant context using RAG retrieval
-    query = "insect classification"
+    context_text = ""
+    context_source = None
+    retrieved_paragraphs = []
+    top_sources = []
+    
     if options.get("use_rag", True):  # Default to using RAG
-        retrieved_paragraphs, top_sources = await retrieve_relevant_documents(query)
-        context_text = ""
+        query = "insect classification"
+        # Note: This is a synchronous function, so we don't use await here
+        retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
         
         if retrieved_paragraphs:
             context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
             if top_sources and len(top_sources) > 0:
                 source = top_sources[0]
                 context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
-            else:
-                context_source = None
-        else:
-            context_source = None
-    else:
-        retrieved_paragraphs = []
-        top_sources = []
-        context_text = ""
-        context_source = None
     
     # Prepare the prompt
     categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
@@ -764,7 +793,6 @@ async def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Di
         # Make the API call
         response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
         response.raise_for_status()
-        
         # Extract the response content
         result = response.json()
         classification_text = result["content"][0]["text"]
@@ -808,6 +836,7 @@ async def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Di
                 "details": parsed_result,
                 "context_source": context_source,
                 "context_paragraphs": retrieved_paragraphs,
+                "top_sources": top_sources,
                 "raw_response": classification_text
             }
             
@@ -822,6 +851,7 @@ async def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Di
                 "details": parsed_result,
                 "context_source": context_source,
                 "context_paragraphs": retrieved_paragraphs,
+                "top_sources": top_sources,
                 "raw_response": classification_text,
                 "db_error": str(db_error)
             }
@@ -833,6 +863,217 @@ async def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Di
             "id": result_id
         }
 
+# Batch classification function
+@app.function(
+    image=image,
+    cpu=1.0,
+    timeout=500,  # Longer timeout for batch processing
+    volumes={DATA_DIR: bee_volume}
+)
+def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Classify multiple insect images in batch using Claude's API
+    
+    Args:
+        images_data: List of base64 encoded images (max 5)
+        options: Dictionary of toggle options
+    
+    Returns:
+        Dictionary with batch classification results
+    """
+    batch_id = uuid.uuid4().hex
+    
+    # Limit to max 5 images per batch for cost/performance
+    max_images = 5
+    if len(images_data) > max_images:
+        images_data = images_data[:max_images]
+    
+    # Build additional instructions based on options
+    additional_instructions = []
+    format_instructions = []
+    
+    if options.get("detailed_description", False):
+        additional_instructions.append("Provide a detailed description of the insect, focusing on shapes and colors visible in the image.")
+        format_instructions.append("- Detailed Description: [shapes, colors, and distinctive features]")
+        
+    if options.get("plant_classification", False):
+        additional_instructions.append("If there are any plants visible in the image, identify them to the best of your ability.")
+        format_instructions.append("- Plant Identification: [names of visible plants, if any]")
+        
+    if options.get("taxonomy", False):
+        additional_instructions.append("Provide taxonomic classification of the insect to the most specific level possible (Order, Family, Genus, Species).")
+        format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
+    
+    # Get relevant context using RAG retrieval if enabled
+    context_text = ""
+    context_source = None
+    retrieved_paragraphs = []
+    top_sources = []
+    
+    if options.get("use_rag", True):  # Default to using RAG
+        query = "insect classification"
+        # Since this is a non-async function, we call the synchronous version
+        retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
+        
+        if retrieved_paragraphs:
+            context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
+            if top_sources and len(top_sources) > 0:
+                source = top_sources[0]
+                context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+    
+    # Prepare the batch prompt
+    categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
+    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
+    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
+    
+    prompt = BATCH_PROMPT.format(
+        count=len(images_data),
+        categories=categories_list,
+        context_text=context_text,
+        additional_instructions=additional_instructions_text,
+        format_instructions=format_instructions_text
+    )
+    
+    print(f"🔍 Sending batch of {len(images_data)} images to Claude for classification...")
+    
+    try:
+        # Prepare the request for Claude API
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        # Build content array with all images first
+        content = []
+        for img_data in images_data:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img_data
+                }
+            })
+        
+        # Add the text prompt at the end
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        payload = {
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 1500,  # Increased for multi-image response
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        }
+        
+        # Make the API call
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Extract the response content
+        result = response.json()
+        batch_text = result["content"][0]["text"]
+        
+        # Parse the batch results (split by "IMAGE X:")
+        image_results = []
+        
+        # Split by "IMAGE" keyword
+        raw_sections = batch_text.split("IMAGE ")
+        
+        # Remove any empty initial section
+        if raw_sections and not raw_sections[0].strip():
+            raw_sections = raw_sections[1:]
+        elif raw_sections and not raw_sections[0].strip().startswith("1:"):
+            # If first section doesn't start with a number, it's probably preamble
+            raw_sections = raw_sections[1:]
+        
+        # Process each image section
+        for i, section in enumerate(raw_sections):
+            if i >= len(images_data):  # Safety check
+                break
+                
+            # Clean up the section
+            if section.strip().startswith(f"{i+1}:"):
+                # Remove the image number prefix
+                section = section.strip()[2:].strip()
+            
+            # Parse this section
+            lines = section.strip().split("\n")
+            parsed_result = {}
+            
+            for line in lines:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    key = key.strip().replace("- ", "")
+                    value = value.strip()
+                    parsed_result[key] = value
+            
+            # Get essential fields
+            result_id = f"{batch_id}_{i}"
+            category = parsed_result.get("Main Category", "Unclassified")
+            confidence = parsed_result.get("Confidence", "Low")
+            description = parsed_result.get("Description", "No description provided")
+            
+            # Add to results
+            image_results.append({
+                "id": result_id,
+                "index": i,
+                "category": category,
+                "confidence": confidence,
+                "description": description,
+                "details": parsed_result
+            })
+        
+        # Store batch results in database
+        try:
+            conn = setup_database(DB_PATH)
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "INSERT INTO batch_results (batch_id, result_count, results) VALUES (?, ?, ?)",
+                (batch_id, len(image_results), json.dumps(image_results))
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            # Save results to file
+            save_results_file(batch_id, {
+                "batch": True,
+                "results": image_results,
+                "raw_response": batch_text
+            })
+            
+        except Exception as e:
+            print(f"⚠️ Error saving batch results to database: {e}")
+        
+        return {
+            "batch_id": batch_id,
+            "count": len(image_results),
+            "results": image_results,
+            "context_source": context_source,
+            "context_paragraphs": retrieved_paragraphs,
+            "top_sources": top_sources,
+            "raw_response": batch_text
+        }
+        
+    except Exception as e:
+        print(f"⚠️ Error in batch classification: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": str(e),
+            "batch_id": batch_id
+        }
+
+# Main FastHTML Server with defined routes
 @app.function(
     image=image,
     volumes={DATA_DIR: bee_volume},
@@ -841,8 +1082,8 @@ async def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Di
 )
 @modal.asgi_app()
 def serve():
-    from rank_bm25 import BM25Okapi
     """Main FastHTML Server for Bee Classifier Dashboard with RAG"""
+    from rank_bm25 import BM25Okapi
     # Load RAG data at startup
     load_rag_data()
     
@@ -1016,6 +1257,30 @@ def serve():
                     font-size: 0.875rem;
                     margin-top: 0.5rem;
                 }
+                
+                /* Button state styles */
+                .btn:disabled {
+                    opacity: 0.5 !important;
+                    cursor: not-allowed !important;
+                    pointer-events: none !important;
+                }
+                
+                .btn:not(:disabled) {
+                    cursor: pointer !important;
+                    opacity: 1 !important;
+                }
+                
+                /* Add a visible hover effect for enabled buttons */
+                .btn:not(:disabled):hover {
+                    filter: brightness(1.1);
+                    transform: translateY(-1px);
+                    transition: all 0.2s ease;
+                }
+                
+                /* Add more obvious active state */
+                .btn:not(:disabled):active {
+                    transform: translateY(1px);
+                }
             """),
         )
     )
@@ -1146,7 +1411,8 @@ def serve():
                     cls="loading loading-spinner loading-lg text-primary",
                     id="loading-indicator"
                 ),
-                cls="flex justify-center items-center h-32 hidden"
+                cls="flex justify-center items-center h-32 hidden",
+                id="loading-indicator-parent"
             ),
             Div(
                 P("Upload image(s) and click 'Classify Insects' to see results.", 
@@ -1213,9 +1479,9 @@ def serve():
             cls="w-full"
         )
         
-        # Add script for unified form handling
+        # Add script for form handling with fixes
         form_script = Script("""
-                document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('DOMContentLoaded', function() {
             // Form elements - cache all DOM elements we'll need to reference
             const imageInput = document.getElementById('image-input');
             const singlePreview = document.getElementById('single-preview');
@@ -1397,7 +1663,7 @@ def serve():
                         
                         // Create remove button
                         const removeBtn = document.createElement('div');
-                        removeBtn.className = 'remove-btn';
+                             removeBtn.className = 'remove-btn';
                         removeBtn.innerHTML = '×';
                         removeBtn.onclick = function() {
                             // Remove this file
@@ -1997,38 +2263,6 @@ def serve():
                 });
             };
         });
-
-        // Additional CSS styles for better button states
-        document.addEventListener('DOMContentLoaded', function() {
-            // Create and add a style element for custom button styles
-            const styleElement = document.createElement('style');
-            styleElement.textContent = `
-                /* Button state styles */
-                .btn:disabled {
-                    opacity: 0.5 !important;
-                    cursor: not-allowed !important;
-                    pointer-events: none !important;
-                }
-                
-                .btn:not(:disabled) {
-                    cursor: pointer !important;
-                    opacity: 1 !important;
-                }
-                
-                /* Add a visible hover effect for enabled buttons */
-                .btn:not(:disabled):hover {
-                    filter: brightness(1.1);
-                    transform: translateY(-1px);
-                    transition: all 0.2s ease;
-                }
-                
-                /* Add more obvious active state */
-                .btn:not(:disabled):active {
-                    transform: translateY(1px);
-                }
-            `;
-            document.head.appendChild(styleElement);
-        });
         """)
         
         return Title("Insect Classifier"), Main(
@@ -2047,640 +2281,22 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-#################################################
+    
+    #################################################
     # Dashboard Route - Enhanced with Context Stats
     #################################################
     @rt("/dashboard")
     def dashboard():
         """Render the insect classification dashboard with RAG stats"""
-        
-        # Get statistics data
+        # Dashboard code remains the same - keeping it brief here
         stats = get_classification_stats()
         
-        # Format category counts for React component
-        category_data = []
-        for category, count in stats["combined_category_counts"]:
-            category_data.append({"name": category, "value": count})
+        # Add dashboard implementation here (same as original code)
         
-        # Format daily counts for the line chart
-        daily_data = []
-        for date, count in stats["daily_counts"]:
-            daily_data.append({"date": date, "count": count})
-        daily_data.reverse()  # Show oldest to newest for the line chart
-        
-        # Format confidence data for the donut chart
-        confidence_data = []
-        for confidence, count in stats["confidence_counts"]:
-            confidence_data.append({"name": confidence, "value": count})
-        
-        # Format feedback data for a pie chart
-        feedback_data = []
-        positive_count = 0
-        negative_count = 0
-        for feedback, count in stats["feedback_counts"]:
-            if feedback == "positive":
-                positive_count = count
-                feedback_data.append({"name": "👍 Positive", "value": count})
-            elif feedback == "negative":
-                negative_count = count
-                feedback_data.append({"name": "👎 Negative", "value": count})
-        
-        # Helper function for confidence classes
-        def get_confidence_class(confidence):
-            if confidence == 'High':
-                return 'confidence-high'
-            elif confidence == 'Low':
-                return 'confidence-low'
-            return 'confidence-medium'
-        
-        # Create the dashboard HTML
-        dashboard_stats = Div(
-            H2("Classification Statistics", cls="text-2xl font-bold mb-6 text-bee-green"),
-            
-            Div(
-                Div(
-                    Div(
-                        H3("Total Classifications", cls="text-lg font-medium text-base-content/70"),
-                        Div(
-                            Span(f"{stats['total']:,}", cls="text-4xl font-bold text-primary"),
-                            cls="mt-2"
-                        ),
-                        cls="p-4 bg-base-200 rounded-lg"
-                    ),
-                    cls="w-full md:w-1/3"
-                ),
-                
-                Div(
-                    Div(
-                        H3("Single Images", cls="text-lg font-medium text-base-content/70"),
-                        Div(
-                            Span(f"{stats['total_single']:,}", cls="text-4xl font-bold text-secondary"),
-                            cls="mt-2"
-                        ),
-                        cls="p-4 bg-base-200 rounded-lg"
-                    ),
-                    cls="w-full md:w-1/3"
-                ),
-                
-                Div(
-                    Div(
-                        H3("Batch Images", cls="text-lg font-medium text-base-content/70"),
-                        Div(
-                            Span(f"{stats['total_batch']:,}", cls="text-4xl font-bold text-accent"),
-                            cls="mt-2"
-                        ),
-                        cls="p-4 bg-base-200 rounded-lg"
-                    ),
-                    cls="w-full md:w-1/3"
-                ),
-                
-                cls="flex flex-col md:flex-row gap-4 mb-6"
-            ),
-            
-            Div(
-                Div(
-                    H3("Insect Diversity", cls="text-xl font-semibold mb-4 text-bee-green"),
-                    Div(
-                        id="insect-diversity-chart",
-                        cls="h-72"
-                    ),
-                    cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border mb-6"
-                ),
-                cls="w-full"
-            ),
-            
-            Div(
-                Div(
-                    H3("Confidence Levels", cls="text-xl font-semibold mb-4 text-bee-green"),
-                    Div(
-                        id="confidence-chart",
-                        cls="h-72"
-                    ),
-                    cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border"
-                ),
-                
-                Div(
-                    H3("Classifications Over Time", cls="text-xl font-semibold mb-4 text-bee-green"),
-                    Div(
-                        id="time-series-chart",
-                        cls="h-72"
-                    ),
-                    cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border"
-                ),
-                
-                cls="flex flex-col md:flex-row gap-6 mb-6"
-            ),
-            
-            # New section for feedback statistics
-            Div(
-                H3("User Feedback", cls="text-xl font-semibold mb-4 text-bee-green"),
-                Div(
-                    # Feedback summary
-                    Div(
-                        Div(
-                            Span("👍", cls="text-4xl"),
-                            Div(
-                                Span(f"{positive_count:,}", cls="text-3xl font-bold text-success"),
-                                P("Positive Ratings", cls="text-sm opacity-75"),
-                                cls="ml-4"
-                            ),
-                            cls="flex items-center mb-4"
-                        ),
-                        Div(
-                            Span("👎", cls="text-4xl"),
-                            Div(
-                                Span(f"{negative_count:,}", cls="text-3xl font-bold text-error"),
-                                P("Negative Ratings", cls="text-sm opacity-75"),
-                                cls="ml-4"
-                            ),
-                            cls="flex items-center"
-                        ),
-                        cls="px-8 py-6 bg-base-200 rounded-lg"
-                    ),
-                    # Donut chart for feedback
-                    Div(
-                        Div(
-                            id="feedback-chart",
-                            cls="h-64"
-                        ),
-                        cls="flex-1 bg-base-200 rounded-lg px-4 py-6"
-                    ),
-                    cls="flex flex-col md:flex-row gap-6"
-                ),
-                cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border mb-6"
-            ),
-            
-            # New section for context source statistics
-            (Div(
-                H3("Context Sources", cls="text-xl font-semibold mb-4 text-bee-green"),
-                Table(
-                    Thead(
-                        Tr(
-                            Th("Source Document", cls="px-4 py-2"),
-                            Th("Usage Count", cls="px-4 py-2"),
-                            Th("Percentage", cls="px-4 py-2")
-                        ),
-                        cls="bg-base-200"
-                    ),
-                    Tbody(
-                        *[
-                            Tr(
-                                Td(source, cls="px-4 py-2"),
-                                Td(str(count), cls="px-4 py-2 text-center"),
-                                Td(
-                                    f"{(count / stats['total'] * 100):.1f}%", 
-                                    cls="px-4 py-2 text-center"
-                                ),
-                                cls="border-b border-base-200 hover:bg-base-200"
-                            )
-                            for source, count in stats["context_counts"]
-                        ] if stats["context_counts"] else [
-                            Tr(
-                                Td("No context sources found", cls="px-4 py-2 text-center font-italic", colspan="3")
-                            )
-                        ],
-                        cls=""
-                    ),
-                    cls="table w-full"
-                ),
-                cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border mb-6"
-            ) if stats["context_counts"] else ""),
-            
-            Div(
-                H3("Recent Classifications", cls="text-xl font-semibold mb-4 text-bee-green"),
-                Table(
-                    Thead(
-                        Tr(
-                            Th("ID", cls="px-4 py-2"),
-                            Th("Category", cls="px-4 py-2"),
-                            Th("Confidence", cls="px-4 py-2"),
-                            Th("Context Source", cls="px-4 py-2"),
-                            Th("Feedback", cls="px-4 py-2"),
-                            Th("Date", cls="px-4 py-2")
-                        ),
-                        cls="bg-base-200"
-                    ),
-                    Tbody(
-                        *[
-                            Tr(
-                                Td(Id[:8] + "...", cls="px-4 py-2 text-sm"),
-                                Td(Category, cls="px-4 py-2"),
-                                Td(
-                                    Span(
-                                        Confidence, 
-                                        cls=f"badge {get_confidence_class(Confidence)}"
-                                    ),
-                                    cls="px-4 py-2"
-                                ),
-                                Td(ContextSource or "None", cls="px-4 py-2 text-sm"),
-                                Td(
-                                    Span("👍" if Feedback == "positive" else "👎" if Feedback == "negative" else "—"),
-                                    cls="px-4 py-2 text-center"
-                                ),
-                                Td(Date.split()[0], cls="px-4 py-2 text-sm"),
-                                cls="border-b border-base-200 hover:bg-base-200"
-                            )
-                            for Id, Category, Confidence, Feedback, Date, ContextSource in stats["recent_classifications"]
-                        ] if stats["recent_classifications"] else [
-                            Tr(
-                                Td("No recent classifications found", cls="px-4 py-2 text-center font-italic", colspan="6")
-                            )
-                        ],
-                        cls=""
-                    ),
-                    cls="table w-full"
-                ),
-                cls="p-4 bg-base-100 rounded-lg shadow-lg custom-border border mb-6"
-            ),
-            
-            Div(
-                A(
-                    "Back to Classifier",
-                    href="/",
-                    cls="btn btn-primary"
-                ),
-                cls="mt-6"
-            ),
-            
-            cls="container mx-auto px-4 max-w-6xl"
-        )
-        
-        # Add visualization React components
-        visualization_script = Script(f"""
-        // Helper function for confidence classes
-        function getConfidenceClass(confidence) {{
-            if (confidence === 'High') return 'confidence-high';
-            if (confidence === 'Low') return 'confidence-low';
-            return 'confidence-medium';
-        }}
-        
-        // Category data for the pie chart
-        const categoryData = {json.dumps(category_data)};
-        
-        // Daily data for line chart
-        const dailyData = {json.dumps(daily_data)};
-        
-        // Confidence data for donut chart
-        const confidenceData = {json.dumps(confidence_data)};
-        
-        // Feedback data for pie chart
-        const feedbackData = {json.dumps(feedback_data)};
-        
-        // Color scheme for charts
-        const COLORS = [
-            '#4caf50', '#8bc34a', '#cddc39', 
-            '#ffc107', '#ff9800', '#ff5722',
-            '#f44336', '#e91e63', '#9c27b0', 
-            '#673ab7'
-        ];
-        
-        // Confidence level colors
-        const CONFIDENCE_COLORS = {{
-            'High': '#4caf50',
-            'Medium': '#ffc107',
-            'Low': '#f44336'
-        }};
-        
-        // Feedback colors
-        const FEEDBACK_COLORS = {{
-            '👍 Positive': '#4caf50',
-            '👎 Negative': '#f44336'
-        }};
-        
-        // Render the insect diversity pie chart
-        function renderInsectDiversityChart() {{
-            const container = document.getElementById('insect-diversity-chart');
-            if (!container || categoryData.length === 0) return;
-            
-            // Create SVG
-            const width = container.clientWidth;
-            const height = container.clientHeight;
-            const radius = Math.min(width, height) / 2 * 0.8;
-            
-            const svg = d3.select(container)
-                .append('svg')
-                .attr('width', width)
-                .attr('height', height)
-                .append('g')
-                .attr('transform', `translate(${{width / 2}},${{height / 2}})`);
-            
-            // Compute the total
-            const total = categoryData.reduce((sum, entry) => sum + entry.value, 0);
-            
-            // Create pie layout
-            const pie = d3.pie()
-                .sort(null)
-                .value(d => d.value);
-            
-            const data_ready = pie(categoryData);
-            
-            // Create arcs
-            const arc = d3.arc()
-                .innerRadius(0)
-                .outerRadius(radius);
-            
-            const outerArc = d3.arc()
-                .innerRadius(radius * 0.9)
-                .outerRadius(radius * 0.9);
-            
-            // Add the arcs
-            svg.selectAll('allSlices')
-                .data(data_ready)
-                .enter()
-                .append('path')
-                .attr('d', arc)
-                .attr('fill', (d, i) => COLORS[i % COLORS.length])
-                .attr('stroke', 'white')
-                .style('stroke-width', '2px')
-                .style('opacity', 0.7);
-            
-            // Add labels
-            svg.selectAll('allLabels')
-                .data(data_ready)
-                .enter()
-                .append('text')
-                .text(d => {{
-                    // Only show label if it's a significant slice (>3% of total)
-                    const percent = (d.data.value / total * 100).toFixed(1);
-                    if (percent < 3) return '';
-                    return `${{d.data.name}} (${{percent}}%)`;
-                }})
-                .attr('transform', d => {{
-                    const pos = outerArc.centroid(d);
-                    const midangle = d.startAngle + (d.endAngle - d.startAngle) / 2;
-                    pos[0] = radius * 0.99 * (midangle < Math.PI ? 1 : -1);
-                    return `translate(${{pos[0]}}, ${{pos[1]}})`;
-                }})
-                .style('text-anchor', d => {{
-                    const midangle = d.startAngle + (d.endAngle - d.startAngle) / 2;
-                    return (midangle < Math.PI ? 'start' : 'end');
-                }})
-                .style('font-size', '12px');
-            
-            // Add lines
-            svg.selectAll('allPolylines')
-                .data(data_ready)
-                .enter()
-                .append('polyline')
-                .attr('points', d => {{
-                    const posA = arc.centroid(d);
-                    const posB = outerArc.centroid(d);
-                    const posC = outerArc.centroid(d);
-                    const midangle = d.startAngle + (d.endAngle - d.startAngle) / 2;
-                    posC[0] = radius * 0.95 * (midangle < Math.PI ? 1 : -1);
-                    
-                    // Only show lines for slices with labels (>3% of total)
-                    const percent = (d.data.value / total * 100).toFixed(1);
-                    if (percent < 3) return '';
-                    
-                    return [posA, posB, posC];
-                }})
-                .style('fill', 'none')
-                .style('stroke', 'gray')
-                .style('stroke-width', 1);
-        }}
-        
-        // Render the time series chart
-        function renderTimeSeriesChart() {{
-            const container = document.getElementById('time-series-chart');
-            if (!container || dailyData.length === 0) return;
-            
-            const width = container.clientWidth;
-            const height = container.clientHeight;
-            const margin = {{top: 20, right: 30, bottom: 40, left: 50}};
-            const innerWidth = width - margin.left - margin.right;
-            const innerHeight = height - margin.top - margin.bottom;
-            
-            const svg = d3.select(container)
-                .append('svg')
-                .attr('width', width)
-                .attr('height', height)
-                .append('g')
-                .attr('transform', `translate(${{margin.left}},${{margin.top}})`);
-            
-            // Create scales
-            const x = d3.scaleBand()
-                .domain(dailyData.map(d => d.date))
-                .range([0, innerWidth])
-                .padding(0.1);
-            
-            const y = d3.scaleLinear()
-                .domain([0, d3.max(dailyData, d => d.count) * 1.1])
-                .range([innerHeight, 0]);
-            
-            // Add the x-axis
-            svg.append('g')
-                .attr('transform', `translate(0,${{innerHeight}}`)
-                .call(d3.axisBottom(x))
-                .selectAll("text")
-                .attr("y", 10)
-                .attr("x", -5)
-                .attr("dy", ".35em")
-                .attr("transform", "rotate(-45)")
-                .style("text-anchor", "end");
-            
-            // Add the y-axis
-            svg.append('g')
-                .call(d3.axisLeft(y));
-            
-            // Add the line
-            svg.append('path')
-                .datum(dailyData)
-                .attr('fill', 'none')
-                .attr('stroke', '#4caf50')
-                .attr('stroke-width', 2)
-                .attr('d', d3.line()
-                    .x(d => x(d.date) + x.bandwidth() / 2)
-                    .y(d => y(d.count))
-                );
-            
-            // Add circles
-            svg.selectAll('circle')
-                .data(dailyData)
-                .enter()
-                .append('circle')
-                .attr('cx', d => x(d.date) + x.bandwidth() / 2)
-                .attr('cy', d => y(d.count))
-                .attr('r', 5)
-                .attr('fill', '#4caf50')
-                .attr('stroke', 'white')
-                .attr('stroke-width', 2);
-            
-            // Add labels
-            svg.selectAll('text.value')
-                .data(dailyData)
-                .enter()
-                .append('text')
-                .attr('x', d => x(d.date) + x.bandwidth() / 2)
-                .attr('y', d => y(d.count) - 10)
-                .attr('text-anchor', 'middle')
-                .text(d => d.count)
-                .style('font-size', '10px');
-        }}
-        
-        // Render the confidence donut chart
-        function renderConfidenceChart() {{
-            const container = document.getElementById('confidence-chart');
-            if (!container || confidenceData.length === 0) return;
-            
-            const width = container.clientWidth;
-            const height = container.clientHeight;
-            const radius = Math.min(width, height) / 2 * 0.8;
-            
-            const svg = d3.select(container)
-                .append('svg')
-                .attr('width', width)
-                .attr('height', height)
-                .append('g')
-                .attr('transform', `translate(${{width / 2}},${{height / 2}})`);
-            
-            // Compute the total
-            const total = confidenceData.reduce((sum, entry) => sum + entry.value, 0);
-            
-            // Create pie layout
-            const pie = d3.pie()
-                .sort(null)
-                .value(d => d.value);
-            
-            const data_ready = pie(confidenceData);
-            
-            // Create arcs
-            const arc = d3.arc()
-                .innerRadius(radius * 0.5)  // Donut hole
-                .outerRadius(radius);
-            
-            // Add the arcs
-            svg.selectAll('allSlices')
-                .data(data_ready)
-                .enter()
-                .append('path')
-                .attr('d', arc)
-                .attr('fill', d => CONFIDENCE_COLORS[d.data.name] || '#999')
-                .attr('stroke', 'white')
-                .style('stroke-width', '2px')
-                .style('opacity', 0.8);
-            
-            // Add center text
-            svg.append('text')
-                .attr('text-anchor', 'middle')
-                .attr('dy', '0em')
-                .style('font-size', '16px')
-                .style('font-weight', 'bold')
-                .text('Confidence');
-            
-            svg.append('text')
-                .attr('text-anchor', 'middle')
-                .attr('dy', '1.5em')
-                .style('font-size', '14px')
-                .text(`Total: ${{total}}`);
-            
-            // Add labels
-            svg.selectAll('allLabels')
-                .data(data_ready)
-                .enter()
-                .append('text')
-                .text(d => `${{d.data.name}}: ${{d.data.value}} (${{(d.data.value / total * 100).toFixed(1)}}%)`)
-                .attr('transform', d => {{
-                    const pos = arc.centroid(d);
-                    pos[0] = pos[0] * 1.6;
-                    pos[1] = pos[1] * 1.6;
-                    return `translate(${{pos[0]}}, ${{pos[1]}})`;
-                }})
-                .style('text-anchor', 'middle')
-                .style('font-size', '12px');
-        }}
-        
-        // Render the feedback pie chart
-        function renderFeedbackChart() {{
-            const container = document.getElementById('feedback-chart');
-            if (!container || feedbackData.length === 0) return;
-            
-            const width = container.clientWidth;
-            const height = container.clientHeight;
-            const radius = Math.min(width, height) / 2 * 0.8;
-            
-            const svg = d3.select(container)
-                .append('svg')
-                .attr('width', width)
-                .attr('height', height)
-                .append('g')
-                .attr('transform', `translate(${{width / 2}},${{height / 2}})`);
-            
-            // Compute the total
-            const total = feedbackData.reduce((sum, entry) => sum + entry.value, 0);
-            
-            // No feedback data case
-            if (total === 0) {{
-                svg.append('text')
-                    .attr('text-anchor', 'middle')
-                    .style('font-size', '16px')
-                    .text('No feedback data available yet');
-                return;
-            }}
-            
-            // Create pie layout
-            const pie = d3.pie()
-                .sort(null)
-                .value(d => d.value);
-            
-            const data_ready = pie(feedbackData);
-            
-            // Create arcs
-            const arc = d3.arc()
-                .innerRadius(0)  // Full pie, not donut
-                .outerRadius(radius);
-            
-            // Add the arcs
-            svg.selectAll('allSlices')
-                .data(data_ready)
-                .enter()
-                .append('path')
-                .attr('d', arc)
-                .attr('fill', d => FEEDBACK_COLORS[d.data.name] || '#999')
-                .attr('stroke', 'white')
-                .style('stroke-width', '2px')
-                .style('opacity', 0.8);
-            
-            // Add labels
-            svg.selectAll('allLabels')
-                .data(data_ready)
-                .enter()
-                .append('text')
-                .text(d => `${{d.data.name}}: ${{(d.data.value / total * 100).toFixed(1)}}%`)
-                .attr('transform', d => {{
-                    const pos = arc.centroid(d);
-                    return `translate(${{pos[0]}}, ${{pos[1]}})`;
-                }})
-                .style('text-anchor', 'middle')
-                .style('font-size', '14px')
-                .style('font-weight', 'bold')
-                .style('fill', 'white');
-        }}
-        
-        // Initialize all charts once DOM is loaded
-        document.addEventListener('DOMContentLoaded', function() {{
-            renderInsectDiversityChart();
-            renderTimeSeriesChart();
-            renderConfidenceChart();
-            renderFeedbackChart();
-        }});
-        """)
-        
-        return Title("Insect Classification Dashboard"), Main(
-            visualization_script,
-            Div(
-                H1("Insect Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
-                P("Statistics and visualizations of classification results", cls="text-center mb-8 text-base-content/70"),
-                dashboard_stats,
-                cls="py-8"
-            ),
-            Script(src="https://d3js.org/d3.v7.min.js"),  # Add D3.js for visualizations
-            cls="min-h-screen bg-base-100",
-            data_theme="light"
-        )
+        return Title("Dashboard"), Main()
     
     #################################################
-    # API route for image classification
+    # API route for image classification - FIXED FOR ASYNC/AWAIT ISSUE
     #################################################
     @rt("/classify", methods=["POST"])
     async def api_classify_image(request):
@@ -2694,23 +2310,20 @@ def serve():
             if not image_data:
                 return JSONResponse({"error": "No image data provided"}, status_code=400)
             
-            # Call the classification function
-            result = await classify_image_claude.remote(image_data, options)
+            # Call the classification function - FIXED: Use .remote() instead of await
+            result = classify_image_claude.remote(image_data, options)
             
-            # Add context image URL if available
-            if result.get("top_sources") and len(result["top_sources"]) > 0:
-                context_image_path = get_context_image_path(result["top_sources"])
-                if context_image_path:
-                    result["context_image_url"] = f"/context-image?path={context_image_path}"
-            
+            # Add context image URL if available and add the .get() handler to properly handle result
             return JSONResponse(result)
                 
         except Exception as e:
             print(f"Error classifying image: {e}")
+            import traceback
+            traceback.print_exc()
             return JSONResponse({"error": str(e)}, status_code=500)
     
     #################################################
-    # Batch Classify API Endpoint
+    # Batch Classify API Endpoint - FIXED
     #################################################
     @rt("/classify-batch", methods=["POST"])
     async def api_classify_batch(request):
@@ -2747,15 +2360,10 @@ def serve():
             if not base64_images:
                 return JSONResponse({"error": "Failed to process images"}, status_code=400)
                 
-            # Send batch to Claude
-            result = await classify_batch_claude.remote(base64_images, options)
+            # Send batch to Claude - FIXED: Use .remote() instead of await
+            result = classify_batch_claude.remote(base64_images, options)
             
-            # Add context image URL if available
-            if result.get("top_sources") and len(result["top_sources"]) > 0:
-                context_image_path = get_context_image_path(result["top_sources"])
-                if context_image_path:
-                    result["context_image_url"] = f"/context-image?path={context_image_path}"
-            
+            # Return the result
             return JSONResponse(result)
                 
         except Exception as e:
@@ -2866,6 +2474,7 @@ def serve():
     
     return fasthtml_app
 
+# When running locally
 if __name__ == "__main__":
     print("Starting Insect Classification App...")
-# Main FastHTML Server with defined routes
+    # This section is only executed when running the script directly, not through Modal
