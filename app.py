@@ -43,7 +43,7 @@ PDF_IMAGES_DIR = "/data/pdf_images"
 HEATMAP_DIR = "/data/heatmaps"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -598,6 +598,21 @@ async def retrieve_relevant_documents(query, top_k=5):
         import traceback
         traceback.print_exc()
         return [], []
+# synchronous wrapper for the async retrieve_relevant_documents
+def retrieve_relevant_documents_sync(query, top_k=5):
+    """Synchronous version of retrieve_relevant_documents for use in non-async functions"""
+    import asyncio
+    
+    # Create a new event loop
+    loop = asyncio.new_event_loop()
+    
+    try:
+        # Run the async function in the event loop and get the result
+        result = loop.run_until_complete(retrieve_relevant_documents(query, top_k))
+        return result
+    finally:
+        # Clean up the event loop
+        loop.close()
 
 # Format image for API calls
 def format_image(image):
@@ -735,9 +750,9 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
     
     if options.get("use_rag", True):  # Default to using RAG
         query = "insect classification"
-        # Note: This is a synchronous function, so we don't use await here
-        retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
-        
+        # Use the synchronous wrapper to call the async function
+        retrieved_paragraphs, top_sources = retrieve_relevant_documents_sync(query, top_k=3)
+
         if retrieved_paragraphs:
             context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
             if top_sources and len(top_sources) > 0:
@@ -912,8 +927,8 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
     
     if options.get("use_rag", True):  # Default to using RAG
         query = "insect classification"
-        # Since this is a non-async function, we call the synchronous version
-        retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
+        # Use the synchronous wrapper to call the async function
+        retrieved_paragraphs, top_sources = retrieve_relevant_documents_sync(query, top_k=3)
         
         if retrieved_paragraphs:
             context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
@@ -2288,12 +2303,293 @@ def serve():
     @rt("/dashboard")
     def dashboard():
         """Render the insect classification dashboard with RAG stats"""
-        # Dashboard code remains the same - keeping it brief here
         stats = get_classification_stats()
         
-        # Add dashboard implementation here (same as original code)
+        # Create navigation bar (same as homepage)
+        navbar = Div(
+            Div(
+                A(
+                    Span("🐝", cls="text-xl"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    href="/",
+                    cls="flex items-center"
+                ),
+                Div(
+                    A(
+                        "Dashboard",
+                        href="/dashboard",
+                        cls="btn btn-sm btn-ghost btn-active"
+                    ),
+                    A(
+                        "Classifier",
+                        href="/",
+                        cls="btn btn-sm btn-ghost"
+                    ),
+                    cls="flex-none"
+                ),
+                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
+            ),
+            cls="w-full"
+        )
         
-        return Title("Dashboard"), Main()
+        # Stats summary cards section
+        summary_cards = Div(
+            Div(
+                Div(
+                    Div(
+                        H3("Total Classifications", cls="font-bold text-lg"),
+                        P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    Div(
+                        H3("Single Images", cls="font-bold text-lg"),
+                        P(str(stats["total_single"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    Div(
+                        H3("Batch Images", cls="font-bold text-lg"),
+                        P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
+            ),
+            cls="mb-8"
+        )
+        
+        # Categories Section
+        categories_section = Div(
+            H2("Classification Categories", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    H3("Distribution by Category", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Category"),
+                                Th("Count"),
+                                Th("Percentage"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(category),
+                                    Td(str(count)),
+                                    Td(f"{count / max(stats['total'], 1) * 100:.1f}%"),
+                                )
+                                for category, count in stats["combined_category_counts"][:10]
+                            ]
+                        ),
+                        cls="table table-zebra w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="w-full"
+            ),
+            cls="mb-8"
+        )
+        
+        # Confidence & Feedback Section
+        confidence_feedback_section = Div(
+            Div(
+                Div(
+                    H3("Confidence Levels", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Confidence"),
+                                Th("Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(
+                                        Span(
+                                            confidence,
+                                            cls=f"badge {'badge-success' if confidence == 'High' else 'badge-warning' if confidence == 'Medium' else 'badge-error'}"
+                                        )
+                                    ),
+                                    Td(str(count)),
+                                )
+                                for confidence, count in stats["confidence_counts"]
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    H3("User Feedback", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Feedback"),
+                                Th("Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(
+                                        Span(
+                                            feedback,
+                                            cls=f"badge {'badge-success' if feedback == 'positive' else 'badge-error'}"
+                                        )
+                                    ),
+                                    Td(str(count)),
+                                )
+                                for feedback, count in stats["feedback_counts"]
+                            ] if stats["feedback_counts"] else [
+                                Tr(
+                                    Td("No feedback yet"),
+                                    Td("0")
+                                )
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-2 gap-6"
+            ),
+            cls="mb-8"
+        )
+        
+        # Recent Classifications Section
+        recent_classifications_section = Div(
+            H2("Recent Classifications", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Table(
+                    Thead(
+                        Tr(
+                            Th("ID"),
+                            Th("Category"),
+                            Th("Confidence"),
+                            Th("Feedback"),
+                            Th("Source"),
+                            Th("Time"),
+                        )
+                    ),
+                    Tbody(
+                        *[
+                            Tr(
+                                Td(id[:8] + "..."),
+                                Td(category),
+                                Td(
+                                    Span(
+                                        confidence,
+                                        cls=f"badge {'badge-success' if confidence == 'High' else 'badge-warning' if confidence == 'Medium' else 'badge-error'}"
+                                    )
+                                ),
+                                Td(
+                                    Span(
+                                        feedback if feedback else "None",
+                                        cls=f"{'badge badge-success' if feedback == 'positive' else 'badge badge-error' if feedback == 'negative' else ''}"
+                                    )
+                                ),
+                                Td(context_source if context_source else "None"),
+                                Td(created_at),
+                            )
+                            for id, category, confidence, feedback, created_at, context_source in stats["recent_classifications"]
+                        ]
+                    ),
+                    cls="table table-zebra w-full"
+                ),
+                cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border overflow-x-auto"
+            ),
+            cls="mb-8"
+        )
+        
+        # Context Sources Section (for RAG stats)
+        rag_section = Div(
+            H2("RAG Context Usage", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    H3("Most Used Context Sources", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Source"),
+                                Th("Usage Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(source),
+                                    Td(str(count)),
+                                )
+                                for source, count in stats["context_counts"]
+                            ] if stats["context_counts"] else [
+                                Tr(
+                                    Td("No context sources recorded yet"),
+                                    Td("0")
+                                )
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="w-full"
+            ),
+            cls="mb-8"
+        )
+        
+        # Daily Classification Activity
+        daily_activity_section = ""
+        if stats["daily_counts"]:
+            daily_activity_section = Div(
+                H2("Daily Classification Activity", cls="text-xl font-bold mb-4 text-bee-green"),
+                Div(
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Date"),
+                                Th("Classifications"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(date),
+                                    Td(str(count)),
+                                )
+                                for date, count in stats["daily_counts"]
+                            ]
+                        ),
+                        cls="table table-zebra w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="mb-8"
+            )
+        
+        return Title("Dashboard - Insect Classifier"), Main(
+            Div(
+                H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
+                P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
+                navbar,
+                summary_cards,
+                categories_section,
+                confidence_feedback_section,
+                recent_classifications_section,
+                rag_section,
+                daily_activity_section,
+                cls="container mx-auto px-4 py-8 max-w-7xl"
+            ),
+            cls="min-h-screen bg-base-100",
+            data_theme="light"
+        )
     
     #################################################
     # API route for image classification - FIXED FOR ASYNC/AWAIT ISSUE
@@ -2310,10 +2606,8 @@ def serve():
             if not image_data:
                 return JSONResponse({"error": "No image data provided"}, status_code=400)
             
-            # Call the classification function - FIXED: Use .remote() instead of await
             result = classify_image_claude.remote(image_data, options)
             
-            # Add context image URL if available and add the .get() handler to properly handle result
             return JSONResponse(result)
                 
         except Exception as e:
@@ -2360,7 +2654,6 @@ def serve():
             if not base64_images:
                 return JSONResponse({"error": "Failed to process images"}, status_code=400)
                 
-            # Send batch to Claude - FIXED: Use .remote() instead of await
             result = classify_batch_claude.remote(base64_images, options)
             
             # Return the result
