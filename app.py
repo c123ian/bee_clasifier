@@ -43,7 +43,7 @@ PDF_IMAGES_DIR = "/data/pdf_images"
 HEATMAP_DIR = "/data/heatmaps"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -2302,8 +2302,11 @@ def serve():
     #################################################
     @rt("/dashboard")
     def dashboard():
-        """Render the insect classification dashboard with RAG stats"""
+        """Render the insect classification dashboard with RAG stats and pie chart"""
         stats = get_classification_stats()
+        
+        # Import the Charts.css stylesheet
+        charts_css = Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/charts.css/dist/charts.min.css")
         
         # Create navigation bar (same as homepage)
         navbar = Div(
@@ -2364,10 +2367,80 @@ def serve():
             cls="mb-8"
         )
         
-        # Categories Section
+        # Categories Section with Pie Chart
+        # Calculate the total for percentage calculations
+        total_insects = sum(count for _, count in stats["combined_category_counts"])
+        
+        # Prepare data for the pie chart - we'll use the top 10 categories
+        pie_data = []
+        start_value = 0.0
+        
+        # Process top 10 categories or all if less than 10
+        categories_to_display = stats["combined_category_counts"][:10]
+        
+        for category, count in categories_to_display:
+            percentage = count / total_insects if total_insects > 0 else 0
+            end_value = start_value + percentage
+            
+            pie_data.append({
+                "category": category,
+                "count": count,
+                "percentage": percentage * 100,  # Convert to percentage
+                "start": start_value,
+                "end": end_value
+            })
+            
+            start_value = end_value
+        
+        # Create table rows for pie chart
+        pie_rows = []
+        for data in pie_data:
+            # Create a table row with styling for the pie chart segment
+            # Format percentages to 1 decimal place
+            pie_rows.append(
+                Tr(
+                    Td(
+                        Span(f"{data['category']}: {data['percentage']:.1f}%", cls="data"),
+                        style=f"--start: {data['start']}; --end: {data['end']};"
+                    )
+                )
+            )
+        
+        # Build the pie chart using Charts.css
+        pie_chart = Div(
+            H3("Insect Category Distribution", cls="font-semibold mb-3 text-center"),
+            Div(
+                Table(
+                    Caption("Category Distribution"),
+                    Tbody(*pie_rows),
+                    cls="charts-css pie show-labels"
+                ),
+                cls="mx-auto w-64 h-64"  # Set dimensions of the chart
+            ),
+            # Add a legend for the pie chart
+            Div(
+                *[
+                    Div(
+                        Span(cls="w-3 h-3 inline-block mr-1", 
+                            style=f"background-color: var(--color-{i+1});"),
+                        Span(f"{data['category']} ({data['count']})", cls="text-sm"),
+                        cls="mb-1"
+                    )
+                    for i, data in enumerate(pie_data)
+                ],
+                cls="mt-4 text-center grid grid-cols-2 gap-2"
+            ),
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+        )
+        
+        # Modified categories section to include pie chart
         categories_section = Div(
             H2("Classification Categories", cls="text-xl font-bold mb-4 text-bee-green"),
             Div(
+                Div(
+                    pie_chart,  # Add the pie chart here
+                    cls="w-full md:w-2/5"
+                ),
                 Div(
                     H3("Distribution by Category", cls="font-semibold mb-3"),
                     Table(
@@ -2390,9 +2463,9 @@ def serve():
                         ),
                         cls="table table-zebra w-full"
                     ),
-                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border w-full md:w-3/5"
                 ),
-                cls="w-full"
+                cls="flex flex-col md:flex-row gap-6 w-full"
             ),
             cls="mb-8"
         )
@@ -2574,13 +2647,100 @@ def serve():
                 cls="mb-8"
             )
         
+        # Add custom CSS for the pie chart colors
+        pie_chart_styles = Style("""
+            /* Pie chart colors */
+            .charts-css.pie tbody tr:nth-child(1) {
+                --color: var(--color-primary);
+            }
+            .charts-css.pie tbody tr:nth-child(2) {
+                --color: var(--color-secondary);
+            }
+            .charts-css.pie tbody tr:nth-child(3) {
+                --color: var(--color-accent);
+            }
+            .charts-css.pie tbody tr:nth-child(4) {
+                --color: #1e88e5;
+            }
+            .charts-css.pie tbody tr:nth-child(5) {
+                --color: #43a047;
+            }
+            .charts-css.pie tbody tr:nth-child(6) {
+                --color: #ffb300;
+            }
+            .charts-css.pie tbody tr:nth-child(7) {
+                --color: #e53935;
+            }
+            .charts-css.pie tbody tr:nth-child(8) {
+                --color: #8e24aa;
+            }
+            .charts-css.pie tbody tr:nth-child(9) {
+                --color: #00acc1;
+            }
+            .charts-css.pie tbody tr:nth-child(10) {
+                --color: #f4511e;
+            }
+            
+            /* Legend color boxes */
+            [style*="--color-1"] {
+                background-color: var(--color-primary);
+            }
+            [style*="--color-2"] {
+                background-color: var(--color-secondary);
+            }
+            [style*="--color-3"] {
+                background-color: var(--color-accent);
+            }
+            [style*="--color-4"] {
+                background-color: #1e88e5;
+            }
+            [style*="--color-5"] {
+                background-color: #43a047;
+            }
+            [style*="--color-6"] {
+                background-color: #ffb300;
+            }
+            [style*="--color-7"] {
+                background-color: #e53935;
+            }
+            [style*="--color-8"] {
+                background-color: #8e24aa;
+            }
+            [style*="--color-9"] {
+                background-color: #00acc1;
+            }
+            [style*="--color-10"] {
+                background-color: #f4511e;
+            }
+            
+            /* Improve Charts.css styling for our theme */
+            .charts-css.pie {
+                --chart-bg: transparent;
+                height: 250px;
+                max-width: 250px;
+                margin: 0 auto;
+            }
+            
+            .charts-css.pie .data {
+                font-size: 10px;
+                color: transparent;
+            }
+            
+            .charts-css caption {
+                margin-bottom: 1rem;
+                font-weight: bold;
+            }
+        """)
+        
         return Title("Dashboard - Insect Classifier"), Main(
+            charts_css,  # Add the Charts.css stylesheet
+            pie_chart_styles,  # Add custom styles for the pie chart
             Div(
                 H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
                 P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
                 navbar,
                 summary_cards,
-                categories_section,
+                categories_section,  # Updated to include pie chart
                 confidence_feedback_section,
                 recent_classifications_section,
                 rag_section,
