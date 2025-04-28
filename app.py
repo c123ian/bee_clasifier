@@ -42,7 +42,7 @@ PDF_IMAGES_DIR = "/data/pdf_images"
 HEATMAP_DIR = "/data/heatmaps"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -1032,25 +1032,36 @@ def serve():
         
         # Create toggle switches for classification options
         def create_toggle(name, label, checked=False, description=None):
+            toggle_input = Input(
+                type="checkbox",
+                name=name,
+                checked="checked" if checked else None,
+                cls="toggle toggle-primary mr-3"
+            )
+            
+            label_span = Span(label)
+            
+            label_element = Label(
+                toggle_input,
+                label_span,
+                cls="label cursor-pointer justify-start"
+            )
+            
             toggle_element = Div(
-                Label(
-                    Input(
-                        type="checkbox",
-                        name=name,
-                        checked="checked" if checked else None,
-                        cls="toggle toggle-primary mr-3"
-                    ),
-                    Span(label),
-                    cls="label cursor-pointer justify-start"
-                ),
+                label_element,
                 cls="mb-3"
             )
             
+            # If description is provided, add it to the container
             if description:
-                toggle_element.append(
-                    P(description, cls="text-sm text-base-content/70 ml-10")
+                description_p = P(description, cls="text-sm text-base-content/70 ml-10")
+                # Create a new Div with both elements
+                toggle_element = Div(
+                    label_element,
+                    description_p,
+                    cls="mb-3"
                 )
-                
+                        
             return toggle_element
         
         # Classification options panel with RAG option
