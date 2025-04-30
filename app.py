@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -857,6 +857,50 @@ def get_trend_indicator(stats):
         "trend": trend_direction,
         "html": html
     }
+
+
+def dashboard():
+    """Render the enhanced insect classification dashboard with Flowbite components and HTMX"""
+    stats = get_classification_stats()
+    
+    # Create navigation bar
+    navbar = Div(
+        Div(
+            A(
+                Span("🐝", cls="text-xl"),
+                Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                href="/",
+                cls="flex items-center"
+            ),
+            Div(
+                A(
+                    "Dashboard",
+                    href="/dashboard",
+                    cls="btn btn-sm btn-ghost btn-active"
+                ),
+                A(
+                    "Classifier",
+                    href="/",
+                    cls="btn btn-sm btn-ghost"
+                ),
+                cls="flex-none"
+            ),
+            cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
+        ),
+        cls="w-full"
+    )
+    
+    # Line chart section
+    trend_data = get_trend_indicator(stats)
+    
+    # Here's the fix - use NotStr instead of Raw
+    Div(
+        P(
+            NotStr(trend_data["html"]),  # This line is fixed
+            cls="text-xl font-bold",
+            id="trend-indicator"
+        )
+    )
 
 def generate_flowbite_table_rows(results):
     """Generate HTML for Flowbite table rows"""
@@ -1825,7 +1869,7 @@ def serve():
                 Div(
                     P("Trend", cls="text-sm text-base-content/70"),
                     P(
-                        Raw(trend_data["html"]),
+                        NotStr(trend_data["html"]),
                         cls="text-xl font-bold",
                         id="trend-indicator"
                     )
@@ -2071,7 +2115,7 @@ def serve():
                             Tr(
                                 # Image Cell
                                 Td(
-                                    Raw(create_image_thumbnail(get_classification_image_path(id)))
+                                    NotStr(create_image_thumbnail(get_classification_image_path(id)))
                                 ),
                                 
                                 # ID Cell
@@ -2081,11 +2125,11 @@ def serve():
                                 Td(category),
                                 
                                 # Confidence Cell
-                                Td(Raw(generate_confidence_badge(confidence))),
+                                Td(NotStr(generate_confidence_badge(confidence))),
                                 
                                 # Feedback Cell
                                 Td(
-                                    Raw(generate_feedback_badge(feedback) if feedback else generate_feedback_buttons(id))
+                                    NotStr(generate_feedback_badge(feedback) if feedback else generate_feedback_buttons(id))
                                 ),
                                 
                                 # Source Cell
@@ -2299,7 +2343,7 @@ def serve():
                     
                     # Table Body with HTMX support
                     Tbody(
-                        Raw(generate_flowbite_table_rows(stats["recent_classifications"])),
+                        NotStr(generate_flowbite_table_rows(stats["recent_classifications"])),
                         id="flowbite-table-body"
                     ),
                     
@@ -2307,7 +2351,6 @@ def serve():
                 ),
                 
                 # Pagination with HTMX
-                # Pagination with HTMX (continuing from where we left off)
                     Nav(
                         Span(
                             "Showing ",
