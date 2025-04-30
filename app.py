@@ -18,7 +18,7 @@ from io import BytesIO
 from nltk.tokenize import word_tokenize
 import matplotlib.pyplot as plt
 from rerankers import Reranker
-
+import traceback
 
 from fasthtml.common import *
 from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
@@ -41,6 +41,7 @@ STATUS_DIR = "/data/status"
 TEMP_UPLOAD_DIR = "/data/temp_uploads"
 PDF_IMAGES_DIR = "/data/pdf_images"
 HEATMAP_DIR = "/data/heatmaps"
+TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
 CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -202,8 +203,9 @@ def save_results_file(result_id, result_content):
     except Exception as e:
         print(f"⚠️ Error saving result file: {e}")
         return False
+    
 
-# Get classification statistics for dashboard
+    # Get classification statistics for dashboard
 def get_classification_stats():
     """Query the database to get statistics about insect classifications"""
     try:
@@ -343,7 +345,6 @@ def get_classification_stats():
         
     except Exception as e:
         print(f"Error getting classification stats: {e}")
-        import traceback
         traceback.print_exc()
         return {
             "category_counts": [],
@@ -357,6 +358,7 @@ def get_classification_stats():
             "total_batch": 0,
             "total": 0
         }
+    
 
 # RAG-related functions
 def load_rag_data():
@@ -427,6 +429,7 @@ def load_rag_data():
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
     os.makedirs(HEATMAP_DIR, exist_ok=True)
     os.makedirs(PDF_IMAGES_DIR, exist_ok=True)
+    os.makedirs(TEMPLATES_DIR, exist_ok=True)
 
 # Retrieve relevant documents for RAG
 async def retrieve_relevant_documents(query, top_k=5):
@@ -595,9 +598,9 @@ async def retrieve_relevant_documents(query, top_k=5):
         
     except Exception as e:
         logging.error(f"Error in document retrieval: {str(e)}")
-        import traceback
         traceback.print_exc()
         return [], []
+
 # synchronous wrapper for the async retrieve_relevant_documents
 def retrieve_relevant_documents_sync(query, top_k=5):
     """Synchronous version of retrieve_relevant_documents for use in non-async functions"""
@@ -613,6 +616,7 @@ def retrieve_relevant_documents_sync(query, top_k=5):
     finally:
         # Clean up the event loop
         loop.close()
+
 
 # Format image for API calls
 def format_image(image):
@@ -705,6 +709,248 @@ def get_context_image_path(top_sources):
         return None
     
     return page_images[image_key] if image_key in page_images else None
+
+
+# Get template path based on environment
+def get_template_path(filename):
+    """Get the correct template path based on environment"""
+    # For Modal deployment
+    if os.path.exists(TEMPLATES_DIR):
+        return os.path.join(TEMPLATES_DIR, filename)
+    
+    # For local development
+    local_template_dir = os.path.join(os.path.dirname(__file__), "templates")
+    if os.path.exists(local_template_dir):
+        return os.path.join(local_template_dir, filename)
+    
+    # Fallback - current directory
+    return filename
+
+# Helper functions for generating HTML components
+def generate_confidence_badge(confidence):
+    """Generate HTML for confidence badge with appropriate color"""
+    confidence_class = 'badge-warning'
+    if confidence == 'High':
+        confidence_class = 'badge-success'
+    elif confidence == 'Low':
+        confidence_class = 'badge-error'
+    
+    return f'<span class="badge {confidence_class}">{confidence}</span>'
+
+def generate_feedback_buttons(result_id):
+    """Generate HTML for feedback buttons with HTMX attributes"""
+    return f"""
+    <div class="flex space-x-1">
+        <button 
+            class="btn btn-xs btn-circle btn-outline" 
+            hx-post="/api/feedback"
+            hx-vals='{{"id": "{result_id}", "feedback": "positive"}}'
+            hx-swap="outerHTML"
+            title="Positive Feedback">
+            👍
+        </button>
+        <button 
+            class="btn btn-xs btn-circle btn-outline" 
+            hx-post="/api/feedback"
+            hx-vals='{{"id": "{result_id}", "feedback": "negative"}}'
+            hx-swap="outerHTML"
+            title="Negative Feedback">
+            👎
+        </button>
+    </div>
+    """
+
+def generate_feedback_badge(feedback):
+    """Generate HTML for feedback badge based on type"""
+    if not feedback:
+        return ""
+    
+    feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+    return f'<span class="badge {feedback_class}">{feedback}</span>'
+
+def create_image_thumbnail(image_path=None):
+    """Create HTML for an image thumbnail, with placeholder if no image is available"""
+    if image_path and os.path.exists(image_path):
+        # Use actual image if available
+        return f"""
+        <div class="avatar">
+            <div class="mask mask-squircle w-12 h-12">
+                <img src="/image-thumbnail?path={image_path}" alt="Classification Image">
+            </div>
+        </div>
+        """
+    else:
+        # Use placeholder if no image available
+        return """
+        <div class="avatar">
+            <div class="mask mask-squircle w-12 h-12 bg-base-300 flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-base-content/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+            </div>
+        </div>
+        """
+
+# Helper function to get image path for a classification
+def get_classification_image_path(result_id):
+    """Attempt to find the image path for a classification result"""
+    # This is a placeholder implementation - in a real application, 
+    # you would store the image paths in the database or retrieve them
+    # from a file system based on the result ID
+    
+    # For now, we'll return None to use placeholders
+    return None
+
+def get_trend_indicator(stats):
+    """Calculate a trend indicator for daily classifications"""
+    daily_counts = stats.get("daily_counts", [])
+    
+    if len(daily_counts) < 2:
+        return {
+            "value": 0,
+            "trend": "neutral",
+            "html": '<span class="text-base-content">-</span>'
+        }
+    
+    # Get counts only
+    counts = [count for _, count in daily_counts]
+    
+    # Calculate trend - compare first half to second half
+    mid_point = len(counts) // 2
+    first_half = sum(counts[:mid_point])
+    second_half = sum(counts[mid_point:])
+    
+    if first_half > 0:
+        trend_value = ((second_half - first_half) / first_half) * 100
+        trend_value = round(trend_value, 1)
+    else:
+        trend_value = 0
+    
+    # Determine trend direction
+    trend_direction = "positive" if trend_value > 0 else "negative" if trend_value < 0 else "neutral"
+    
+    # Create HTML
+    if trend_direction == "positive":
+        html = f"""
+        <span class="inline-flex items-center text-success">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+            </svg>
+            {abs(trend_value)}%
+        </span>
+        """
+    elif trend_direction == "negative":
+        html = f"""
+        <span class="inline-flex items-center text-error">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+            </svg>
+            {abs(trend_value)}%
+        </span>
+        """
+    else:
+        html = '<span class="text-base-content">0%</span>'
+    
+    return {
+        "value": trend_value,
+        "trend": trend_direction,
+        "html": html
+    }
+
+def generate_flowbite_table_rows(results):
+    """Generate HTML for Flowbite table rows"""
+    if not results:
+        return """
+        <tr>
+            <td colspan="6" class="px-6 py-4 text-center">
+                No classification results found.
+            </td>
+        </tr>
+        """
+    
+    html = ""
+    for id, category, confidence, feedback, created_at, context_source in results:
+        # Determine confidence class for Flowbite styling
+        confidence_class = 'bg-yellow-100 text-yellow-800'
+        if confidence == 'High':
+            confidence_class = 'bg-green-100 text-green-800'
+        elif confidence == 'Low':
+            confidence_class = 'bg-red-100 text-red-800'
+        
+        # Build the table row
+        html += f"""
+        <tr class="bg-white border-b dark:bg-gray-800 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600">
+            <!-- Image column -->
+            <td class="px-6 py-4">
+                <div class="relative w-10 h-10 overflow-hidden bg-gray-100 rounded-full dark:bg-gray-600 cursor-pointer"
+                     onclick="showImageModal('{id}', '{category}', '{confidence}')">
+                    <svg class="absolute w-12 h-12 text-gray-400 -left-1" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+                        <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"></path>
+                    </svg>
+                </div>
+            </td>
+            
+            <!-- Category column -->
+            <td class="px-6 py-4 font-medium text-gray-900 whitespace-nowrap dark:text-white">
+                {category}
+            </td>
+            
+            <!-- Confidence column -->
+            <td class="px-6 py-4">
+                <span class="px-2 py-1 rounded-full text-xs font-semibold {confidence_class}">
+                    {confidence}
+                </span>
+            </td>
+        """
+        
+        # Feedback column with HTMX support
+        if feedback:
+            feedback_class = 'bg-green-100 text-green-800' if feedback == 'positive' else 'bg-red-100 text-red-800'
+            html += f"""
+            <td class="px-6 py-4">
+                <span class="px-2 py-1 rounded-full text-xs font-semibold {feedback_class}">
+                    {feedback}
+                </span>
+            </td>
+            """
+        else:
+            html += f"""
+            <td class="px-6 py-4">
+                <div class="flex space-x-1" hx-target="this" hx-swap="outerHTML">
+                    <button 
+                        class="text-gray-500 hover:text-green-500 focus:outline-none" 
+                        hx-post="/api/feedback"
+                        hx-vals='{{"id": "{id}", "feedback": "positive"}}'>
+                        👍
+                    </button>
+                    <button 
+                        class="text-gray-500 hover:text-red-500 focus:outline-none" 
+                        hx-post="/api/feedback"
+                        hx-vals='{{"id": "{id}", "feedback": "negative"}}'>
+                        👎
+                    </button>
+                </div>
+            </td>
+            """
+        
+        # Date and actions columns
+        html += f"""
+            <td class="px-6 py-4">
+                {created_at}
+            </td>
+            
+            <td class="px-6 py-4 text-right">
+                <button 
+                    class="font-medium text-blue-600 dark:text-blue-500 hover:underline"
+                    onclick="showImageModal('{id}', '{category}', '{confidence}')">
+                    View
+                </button>
+            </td>
+        </tr>
+        """
+    
+    return html
 
 # Generate classification using Claude's API for a single image
 @app.function(
@@ -877,7 +1123,7 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
             "error": str(e),
             "id": result_id
         }
-
+    
 # Batch classification function
 @app.function(
     image=image,
@@ -1081,7 +1327,6 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
         
     except Exception as e:
         print(f"⚠️ Error in batch classification: {e}")
-        import traceback
         traceback.print_exc()
         return {
             "error": str(e),
@@ -1107,7 +1352,13 @@ def serve():
         hdrs=(
             Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@3.9.2/dist/full.css"),
             Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css"),
+            # Add Flowbite CSS
+            Link(rel="stylesheet", href="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.2.0/flowbite.min.css"),
             Script(src="https://unpkg.com/htmx.org@1.9.10"),
+            # Add Flowbite JavaScript
+            Script(src="https://cdnjs.cloudflare.com/ajax/libs/flowbite/2.2.0/flowbite.min.js"),
+            # Add ApexCharts for better charts
+            Script(src="https://cdn.jsdelivr.net/npm/apexcharts"),
             # Add custom theme styles
             Style("""
                 :root {
@@ -1133,6 +1384,8 @@ def serve():
                 --color-error-content: oklch(97% 0.014 343.198);
                 }
 
+                /* Original styling remains */
+                
                 /* Custom styling */
                 .text-bee-green {
                     color: oklch(47% 0.266 120.957);
@@ -1197,104 +1450,77 @@ def serve():
                     cursor: pointer;
                 }
                 
-                /* Carousel styles */
-                .carousel {
-                    position: relative;
-                    overflow: hidden;
-                    width: 100%;
-                }
-                
-                .carousel-inner {
-                    display: flex;
-                    transition: transform 0.5s ease;
-                }
-                
-                .carousel-item {
-                    flex: 0 0 100%;
-                    width: 100%;
-                }
-                
-                .carousel-control {
-                    position: absolute;
-                    top: 50%;
-                    transform: translateY(-50%);
-                    z-index: 10;
-                }
-                
-                .carousel-control-prev {
-                    left: 10px;
-                }
-                
-                .carousel-control-next {
-                    right: 10px;
-                }
-                
-                .carousel-indicators {
-                    display: flex;
-                    justify-content: center;
-                    margin-top: 15px;
-                }
-                
-                .carousel-indicator {
-                    width: 10px;
-                    height: 10px;
-                    border-radius: 50%;
-                    background: var(--color-base-300);
-                    margin: 0 5px;
-                    cursor: pointer;
-                }
-                
-                .carousel-indicator.active {
-                    background: var(--color-primary);
-                }
-                
-                /* New context section styles */
-                .context-section {
-                    background-color: var(--color-base-200);
-                    border-radius: 0.5rem;
-                    padding: 1rem;
-                    margin-top: 1rem;
-                }
-                
-                .context-image {
-                    max-height: 200px;
-                    object-fit: contain;
-                    margin: 0 auto;
-                    display: block;
-                    border-radius: 0.5rem;
+                /* Add Flowbite compatibility styles */
+                .flowbite-card {
+                    background-color: var(--color-base-100);
                     border: 1px solid var(--color-base-300);
+                    border-radius: 0.5rem;
                 }
                 
-                .context-text {
-                    background-color: var(--color-base-300);
-                    padding: 0.75rem;
-                    border-radius: 0.375rem;
-                    font-size: 0.875rem;
-                    margin-top: 0.5rem;
+                .flowbite-table th, .flowbite-table td {
+                    padding: 0.75rem 1rem;
                 }
                 
-                /* Button state styles */
-                .btn:disabled {
-                    opacity: 0.5 !important;
-                    cursor: not-allowed !important;
-                    pointer-events: none !important;
+                /* Custom styles for the donut chart */
+                #donut-chart-container {
+                    height: 320px;
                 }
                 
-                .btn:not(:disabled) {
-                    cursor: pointer !important;
-                    opacity: 1 !important;
+                /* Custom styles for the line chart */
+                #line-chart-container {
+                    height: 300px;
                 }
                 
-                /* Add a visible hover effect for enabled buttons */
-                .btn:not(:disabled):hover {
-                    filter: brightness(1.1);
-                    transform: translateY(-1px);
-                    transition: all 0.2s ease;
+                /* Table image thumbnails */
+                .bee-thumbnail {
+                    width: 60px;
+                    height: 60px;
+                    object-fit: cover;
+                    border-radius: 0.25rem;
                 }
                 
-                /* Add more obvious active state */
-                .btn:not(:disabled):active {
-                    transform: translateY(1px);
+                /* HTMX loading indicator */
+                .htmx-indicator {
+                    opacity: 0;
+                    transition: opacity 200ms ease-in;
+                }
+                .htmx-request .htmx-indicator {
+                    opacity: 1;
+                }
+                .htmx-request.htmx-indicator {
+                    opacity: 1;
+                }
+                
+                /* Pie chart colors */
+                [style*="--color-1"] {
+                    background-color: var(--color-primary);
+                }
+                [style*="--color-2"] {
+                    background-color: var(--color-secondary);
+                }
+                [style*="--color-3"] {
+                    background-color: var(--color-accent);
+                }
+                [style*="--color-4"] {
+                    background-color: #1e88e5;
+                }
+                [style*="--color-5"] {
+                    background-color: #43a047;
+                }
+                [style*="--color-6"] {
+                    background-color: #ffb300;
+                }
+                [style*="--color-7"] {
+                    background-color: #e53935;
+                }
+                [style*="--color-8"] {
+                    background-color: #8e24aa;
+                }
+                [style*="--color-9"] {
+                    background-color: #00acc1;
+                }
+                [style*="--color-10"] {
+                    background-color: #f4511e;
                 }
             """),
         )
@@ -1303,6 +1529,2019 @@ def serve():
     # Ensure database exists
     setup_database(DB_PATH)
     
+    #################################################
+    # Dashboard Route - Enhanced with Flowbite and HTMX
+    #################################################
+    @rt("/dashboard")
+    def dashboard():
+        """Render the enhanced insect classification dashboard with Flowbite components and HTMX"""
+        stats = get_classification_stats()
+        
+        # Create navigation bar
+        navbar = Div(
+            Div(
+                A(
+                    Span("🐝", cls="text-xl"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    href="/",
+                    cls="flex items-center"
+                ),
+                Div(
+                    A(
+                        "Dashboard",
+                        href="/dashboard",
+                        cls="btn btn-sm btn-ghost btn-active"
+                    ),
+                    A(
+                        "Classifier",
+                        href="/",
+                        cls="btn btn-sm btn-ghost"
+                    ),
+                    cls="flex-none"
+                ),
+                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
+            ),
+            cls="w-full"
+        )
+        
+        # Stats summary cards section
+        summary_cards = Div(
+            Div(
+                Div(
+                    Div(
+                        H3("Total Classifications", cls="font-bold text-lg"),
+                        P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    Div(
+                        H3("Single Images", cls="font-bold text-lg"),
+                        P(str(stats["total_single"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    Div(
+                        H3("Batch Images", cls="font-bold text-lg"),
+                        P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
+                        cls="p-6"
+                    ),
+                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
+            ),
+            cls="mb-8"
+        )
+        
+        # Calculate data for the donut chart
+        total_insects = sum(count for _, count in stats["combined_category_counts"])
+        pie_data = []
+        start_value = 0.0
+        
+        # Process top 10 categories or all if less than 10
+        categories_to_display = stats["combined_category_counts"][:10]
+        
+        for category, count in categories_to_display:
+            percentage = count / total_insects if total_insects > 0 else 0
+            end_value = start_value + percentage
+            
+            pie_data.append({
+                "category": category,
+                "count": count,
+                "percentage": percentage * 100,  # Convert to percentage
+                "start": start_value,
+                "end": end_value
+            })
+            
+            start_value = end_value
+        
+        # Create Donut Chart HTML with ApexCharts
+        donut_chart = Div(
+            H3("Insect Category Distribution", cls="font-semibold mb-4 text-center text-bee-green text-lg"),
+            
+            # Chart Container
+            Div(
+                id="donut-chart-container",
+                cls="mx-auto"
+            ),
+            
+            # HTMX-powered chart reload button
+            Div(
+                Button(
+                    "Refresh Chart Data",
+                    cls="btn btn-sm btn-outline btn-primary mt-4",
+                    hx_get="/api/chart-data",
+                    hx_target="#donut-chart-container",
+                    hx_trigger="click",
+                    hx_indicator="#chart-loading"
+                ),
+                Span(
+                    Span(cls="loading loading-spinner loading-xs ml-2"),
+                    cls="htmx-indicator",
+                    id="chart-loading"
+                ),
+                cls="text-center mt-4"
+            ),
+            
+            # ApexCharts initialization script
+            Script(f"""
+            document.addEventListener('DOMContentLoaded', function() {{
+                // Extract data from server-side rendering
+                const categoryData = {json.dumps([{'category': cat, 'count': count} for cat, count in categories_to_display])};
+                
+                // Prepare data for ApexCharts
+                const labels = categoryData.map(item => item.category);
+                const counts = categoryData.map(item => item.count);
+                
+                // Custom bee-themed colors
+                const colors = [
+                    '#8B5A00', // Brown
+                    '#FFC107', // Yellow
+                    '#A5D6A7', // Light Green
+                    '#66BB6A', // Medium Green
+                    '#43A047', // Dark Green
+                    '#FFB74D', // Light Orange
+                    '#FFA000', // Dark Amber
+                    '#E65100', // Dark Orange
+                    '#795548', // Medium Brown
+                    '#4E342E'  // Dark Brown
+                ];
+                
+                // Initialize ApexCharts Donut Chart
+                const donutChart = new ApexCharts(document.querySelector("#donut-chart-container"), {{
+                    series: counts,
+                    chart: {{
+                        type: 'donut',
+                        height: 320,
+                        fontFamily: 'inherit',
+                        foreColor: 'inherit',
+                        animations: {{
+                            enabled: true,
+                            easing: 'easeinout',
+                            speed: 800
+                        }}
+                    }},
+                    labels: labels,
+                    colors: colors,
+                    legend: {{
+                        position: 'bottom',
+                        fontSize: '14px',
+                        formatter: function(seriesName, opts) {{
+                            // Show category name and percentage
+                            return `${{seriesName}}: ${{Math.round(opts.w.globals.series[opts.seriesIndex]/opts.w.globals.seriesTotals[0]*100)}}%`;
+                        }}
+                    }},
+                    tooltip: {{
+                        y: {{
+                            formatter: function(value) {{
+                                return value + " classifications";
+                            }}
+                        }}
+                    }},
+                    dataLabels: {{
+                        enabled: false
+                    }},
+                    responsive: [{{
+                        breakpoint: 480,
+                        options: {{
+                            chart: {{
+                                height: 260
+                            }},
+                            legend: {{
+                                position: 'bottom'
+                            }}
+                        }}
+                    }}],
+                    plotOptions: {{
+                        pie: {{
+                            donut: {{
+                                size: '50%',
+                                labels: {{
+                                    show: true,
+                                    name: {{
+                                        show: true
+                                    }},
+                                    value: {{
+                                        show: true,
+                                        formatter: function(val) {{
+                                            return val;
+                                        }}
+                                    }},
+                                    total: {{
+                                        show: true,
+                                        label: 'Total',
+                                        formatter: function(w) {{
+                                            return w.globals.seriesTotals.reduce((a, b) => a + b, 0);
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
+                
+                // Render the chart
+                donutChart.render();
+                
+                // Set up HTMX event listener to update chart when new data is received
+                document.body.addEventListener('htmx:afterSwap', function(evt) {{
+                    if (evt.detail.target.id === 'donut-chart-container') {{
+                        // Parse the new data (assuming JSON response)
+                        try {{
+                            const newData = JSON.parse(evt.detail.xhr.response);
+                            donutChart.updateSeries(newData.counts);
+                            donutChart.updateOptions({{
+                                labels: newData.labels
+                            }});
+                        }} catch(e) {{
+                            console.error('Error updating chart:', e);
+                        }}
+                    }}
+                }});
+            }});
+            """),
+            
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+        )
+        
+        # Create Line Chart for Activity
+        trend_data = get_trend_indicator(stats)
+        line_chart = Div(
+            Div(
+                H3("Daily Classification Activity", cls="font-semibold text-bee-green text-lg"),
+                
+                # HTMX-powered time range selector
+                Div(
+                    Div(role="button", tabindex="0", cls="btn btn-sm btn-outline"),
+                    Span("Last 7 days", id="current-range"),
+                    Svg(
+                        Path(
+                            stroke="currentColor",
+                            stroke_linecap="round",
+                            stroke_linejoin="round",
+                            stroke_width="2",
+                            d="m1 1 4 4 4-4"
+                        ),
+                        cls="w-2.5 h-2.5 ml-1.5",
+                        aria_hidden="true",
+                        xmlns="http://www.w3.org/2000/svg",
+                        fill="none",
+                        viewBox="0 0 10 6"
+                    ),
+                    cls="dropdown dropdown-end"
+                ),
+                
+                cls="flex justify-between mb-4"
+            ),
+            
+            # Chart Container with Loading Indicator
+            Div(
+                Div(id="line-chart-container", cls="w-full"),
+                Div(
+                    Span(cls="loading loading-spinner loading-md text-primary"),
+                    id="line-loading",
+                    cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-60"
+                ),
+                cls="relative"
+            ),
+            
+            # Summary Statistics
+            Div(
+                Div(
+                    P("Total", cls="text-sm text-base-content/70"),
+                    P(str(stats["total"]), cls="text-xl font-bold", id="total-classifications")
+                ),
+                Div(
+                    P("Average / Day", cls="text-sm text-base-content/70"),
+                    P(
+                        str(round(stats["total"] / len(stats["daily_counts"])) if stats["daily_counts"] else 0),
+                        cls="text-xl font-bold",
+                        id="avg-classifications"
+                    )
+                ),
+                Div(
+                    P("Trend", cls="text-sm text-base-content/70"),
+                    P(
+                        Raw(trend_data["html"]),
+                        cls="text-xl font-bold",
+                        id="trend-indicator"
+                    )
+                ),
+                cls="grid grid-cols-3 gap-4 mt-4"
+            ),
+            
+            # Line Chart Initialization Script
+            Script(f"""
+            document.addEventListener('DOMContentLoaded', function() {{
+                // Extract data from server-side rendering
+                const dailyData = {json.dumps([{'date': date, 'count': count} for date, count in stats["daily_counts"]])};
+                
+                // Prepare data for ApexCharts
+                const dates = dailyData.map(item => item.date);
+                const counts = dailyData.map(item => item.count);
+                
+                // Initialize the line chart
+                const lineChart = new ApexCharts(document.querySelector("#line-chart-container"), {{
+                    series: [{{
+                        name: 'Classifications',
+                        data: counts
+                    }}],
+                    chart: {{
+                        height: 300,
+                        type: 'line',
+                        fontFamily: 'inherit',
+                        foreColor: 'inherit',
+                        toolbar: {{
+                            show: false
+                        }},
+                        animations: {{
+                            enabled: true,
+                            easing: 'easeinout',
+                            speed: 800
+                        }}
+                    }},
+                    stroke: {{
+                        width: 3,
+                        curve: 'smooth'
+                    }},
+                    colors: ['oklch(47% 0.266 120.957)'], // Primary green color
+                    markers: {{
+                        size: 5,
+                        strokeWidth: 0,
+                        hover: {{
+                            size: 7
+                        }}
+                    }},
+                    xaxis: {{
+                        categories: dates,
+                        labels: {{
+                            rotateAlways: false,
+                            style: {{
+                                fontSize: '12px'
+                            }}
+                        }}
+                    }},
+                    yaxis: {{
+                        title: {{
+                            text: 'Classifications'
+                        }},
+                        min: 0,
+                        forceNiceScale: true
+                    }},
+                    tooltip: {{
+                        shared: true,
+                        intersect: false,
+                        y: {{
+                            formatter: function(value) {{
+                                return value + " classifications";
+                            }}
+                        }}
+                    }},
+                    grid: {{
+                        show: true,
+                        borderColor: 'var(--color-base-300)',
+                        strokeDashArray: 5,
+                        position: 'back'
+                    }},
+                    fill: {{
+                        type: 'gradient',
+                        gradient: {{
+                            shade: 'light',
+                            type: "vertical",
+                            shadeIntensity: 0.3,
+                            inverseColors: false,
+                            opacityFrom: 0.7,
+                            opacityTo: 0.2,
+                            stops: [0, 100]
+                        }}
+                    }}
+                }});
+                
+                // Render the line chart
+                lineChart.render();
+            }});
+            """),
+            
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+        )
+        
+        # Charts Section
+        charts_section = Div(
+            H2("Classification Overview", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    donut_chart,
+                    cls="w-full lg:w-1/2"
+                ),
+                Div(
+                    line_chart,
+                    cls="w-full lg:w-1/2"
+                ),
+                cls="flex flex-col lg:flex-row gap-6 w-full"
+            ),
+            cls="mb-8"
+        )
+        
+        # Confidence & Feedback Section
+        confidence_feedback_section = Div(
+            Div(
+                Div(
+                    H3("Confidence Levels", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Confidence"),
+                                Th("Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(
+                                        Span(
+                                            confidence,
+                                            cls=f"badge {'badge-success' if confidence == 'High' else 'badge-warning' if confidence == 'Medium' else 'badge-error'}"
+                                        )
+                                    ),
+                                    Td(str(count)),
+                                )
+                                for confidence, count in stats["confidence_counts"]
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                Div(
+                    H3("User Feedback", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Feedback"),
+                                Th("Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(
+                                        Span(
+                                            feedback,
+                                            cls=f"badge {'badge-success' if feedback == 'positive' else 'badge-error'}"
+                                        )
+                                    ),
+                                    Td(str(count)),
+                                )
+                                for feedback, count in stats["feedback_counts"]
+                            ] if stats["feedback_counts"] else [
+                                Tr(
+                                    Td("No feedback yet"),
+                                    Td("0")
+                                )
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-2 gap-6"
+            ),
+            cls="mb-8"
+        )
+        
+        # DaisyUI Table for Recent Classifications
+        daisyui_table = Div(
+            Div(
+                H3("Recent Classifications", cls="font-semibold mb-3"),
+                
+                # HTMX-powered refresh button
+                Button(
+                    Svg(
+                        Path(
+                            stroke_linecap="round",
+                            stroke_linejoin="round",
+                            stroke_width="2",
+                            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                        ),
+                        cls="h-4 w-4 mr-1",
+                        xmlns="http://www.w3.org/2000/svg",
+                        fill="none",
+                        viewBox="0 0 24 24",
+                        stroke="currentColor"
+                    ),
+                    "Refresh",
+                    cls="btn btn-sm btn-outline btn-primary",
+                    hx_get="/api/recent-classifications",
+                    hx_target="#classifications-table-container",
+                    hx_trigger="click",
+                    hx_indicator="#table-loading"
+                ),
+                Span(
+                    Span(cls="loading loading-spinner loading-xs ml-2"),
+                    cls="htmx-indicator",
+                    id="table-loading"
+                ),
+                
+                cls="flex justify-between items-center mb-4"
+            ),
+            
+            # Table Container
+            Div(
+                Table(
+                    # Table Head
+                    Thead(
+                        Tr(
+                            Th("Image"),
+                            Th("ID"),
+                            Th("Category"),
+                            Th("Confidence"),
+                            Th("Feedback"),
+                            Th("Source"),
+                            Th("Time"),
+                            Th("Actions")
+                        )
+                    ),
+                    
+                    # Table Body
+                    Tbody(
+                        *[
+                            Tr(
+                                # Image Cell
+                                Td(
+                                    Raw(create_image_thumbnail(get_classification_image_path(id)))
+                                ),
+                                
+                                # ID Cell
+                                Td(f"{id[:8]}..."),
+                                
+                                # Category Cell
+                                Td(category),
+                                
+                                # Confidence Cell
+                                Td(Raw(generate_confidence_badge(confidence))),
+                                
+                                # Feedback Cell
+                                Td(
+                                    Raw(generate_feedback_badge(feedback) if feedback else generate_feedback_buttons(id))
+                                ),
+                                
+                                # Source Cell
+                                Td(
+                                    context_source if context_source else "None",
+                                    cls="max-w-xs truncate",
+                                    title=context_source if context_source else "No source"
+                                ),
+                                
+                                # Time Cell
+                                Td(created_at),
+                                
+                                # Actions Cell
+                                Td(
+                                    Div(
+                                        Div(role="button", tabindex="0", cls="btn btn-xs btn-ghost m-1"),
+                                        Svg(
+                                            Path(
+                                                stroke_linecap="round",
+                                                stroke_linejoin="round",
+                                                stroke_width="2",
+                                                d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z"
+                                            ),
+                                            cls="h-4 w-4",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="none",
+                                            viewBox="0 0 24 24",
+                                            stroke="currentColor"
+                                        ),
+                                        cls="dropdown dropdown-end"
+                                    )
+                                )
+                            )
+                            for id, category, confidence, feedback, created_at, context_source in stats["recent_classifications"]
+                        ]
+                    ),
+                    cls="table table-zebra w-full"
+                ),
+                id="classifications-table-container",
+                cls="overflow-x-auto"
+            ),
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+        )
+        
+        # Flowbite Table for All Classifications
+        flowbite_table = Div(
+            Div(
+                H3("All Classifications", cls="font-semibold mb-3"),
+                
+                # Search and Filter Controls
+                Div(
+                    # Search input with HTMX
+                    Div(
+                        Div(
+                            Svg(
+                                Path(
+                                    stroke="currentColor",
+                                    stroke_linecap="round",
+                                    stroke_linejoin="round",
+                                    stroke_width="2",
+                                    d="m19 19-4-4m0-7A7 7 0 1 1 1 8a7 7 0 0 1 14 0Z"
+                                ),
+                                cls="w-4 h-4 text-gray-500 dark:text-gray-400",
+                                aria_hidden="true",
+                                xmlns="http://www.w3.org/2000/svg",
+                                fill="none",
+                                viewBox="0 0 20 20"
+                            ),
+                            cls="absolute inset-y-0 left-0 flex items-center pl-3 pointer-events-none"
+                        ),
+                        Input(
+                            type="text",
+                            id="classification-search",
+                            cls="block w-full p-2 pl-10 text-sm border border-base-300 rounded-lg bg-base-100",
+                            placeholder="Search classifications...",
+                            hx_post="/api/search-classifications",
+                            hx_trigger="keyup changed delay:500ms",
+                            hx_target="#flowbite-table-body",
+                            hx_indicator="#search-indicator"
+                        ),
+                        Div(
+                            Span(cls="loading loading-spinner loading-xs"),
+                            id="search-indicator",
+                            cls="htmx-indicator absolute inset-y-0 right-0 flex items-center pr-3"
+                        ),
+                        cls="relative w-full sm:w-64"
+                    ),
+                    
+                    # Category filter dropdown
+                    Select(
+                        Option("All Categories", value=""),
+                        *[
+                            Option(category, value=category)
+                            for category, _ in stats["category_counts"]
+                        ],
+                        cls="block w-full sm:w-auto p-2 text-sm border border-base-300 rounded-lg bg-base-100",
+                        hx_post="/api/filter-classifications",
+                        hx_trigger="change",
+                        hx_target="#flowbite-table-body",
+                        hx_indicator="#filter-indicator"
+                    ),
+                    Span(
+                        cls="htmx-indicator loading loading-spinner loading-xs ml-2",
+                        id="filter-indicator"
+                    ),
+                    
+                    cls="flex flex-col sm:flex-row gap-3 w-full md:w-auto"
+                ),
+                
+                cls="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4"
+            ),
+            
+            # Flowbite Table Container
+            Div(
+                Table(
+                    # Table Head
+                    Thead(
+                        Tr(
+                            Th(
+                                Span("Image", cls="flex items-center"),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Category",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=category&dir=asc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Confidence",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=confidence&dir=asc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Feedback",
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Div(
+                                    "Date",
+                                    A(
+                                        Svg(
+                                            Path(
+                                                d="M8.574 11.024h6.852a2.075 2.075 0 0 0 1.847-1.086 1.9 1.9 0 0 0-.11-1.986L13.736 2.9a2.122 2.122 0 0 0-3.472 0L6.837 7.952a1.9 1.9 0 0 0-.11 1.986 2.074 2.074 0 0 0 1.847 1.086Zm6.852 1.952H8.574a2.072 2.072 0 0 0-1.847 1.087 1.9 1.9 0 0 0 .11 1.985l3.426 5.05a2.123 2.123 0 0 0 3.472 0l3.427-5.05a1.9 1.9 0 0 0 .11-1.985 2.074 2.074 0 0 0-1.846-1.087Z"
+                                            ),
+                                            cls="w-3 h-3",
+                                            aria_hidden="true",
+                                            xmlns="http://www.w3.org/2000/svg",
+                                            fill="currentColor",
+                                            viewBox="0 0 24 24"
+                                        ),
+                                        href="#",
+                                        cls="ml-1.5",
+                                        hx_get="/api/sort-classifications?field=date&dir=desc",
+                                        hx_target="#flowbite-table-body"
+                                    ),
+                                    cls="flex items-center"
+                                ),
+                                scope="col",
+                                cls="px-6 py-3"
+                            ),
+                            Th(
+                                Span("Actions", cls="sr-only"),
+                                scope="col",
+                                cls="px-6 py-3"
+                            )
+                        )
+                    ),
+                    
+                    # Table Body with HTMX support
+                    Tbody(
+                        Raw(generate_flowbite_table_rows(stats["recent_classifications"])),
+                        id="flowbite-table-body"
+                    ),
+                    
+                    cls="w-full text-sm text-left text-gray-500 dark:text-gray-400 flowbite-table"
+                ),
+                
+                # Pagination with HTMX
+                # Pagination with HTMX (continuing from where we left off)
+                    Nav(
+                        Span(
+                            "Showing ",
+                            Span("1-10", cls="font-semibold text-gray-900 dark:text-white"),
+                            " of ",
+                            Span(str(stats["total_single"]), cls="font-semibold text-gray-900 dark:text-white"),
+                            cls="text-sm font-normal text-gray-500 dark:text-gray-400"
+                        ),
+                        Ul(
+                            Li(
+                                A(
+                                    "Previous",
+                                    href="#",
+                                    cls="flex items-center justify-center px-3 h-8 ml-0 leading-tight text-gray-500 bg-white border border-gray-300 rounded-l-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                    hx_get="/api/classifications-page?page=prev",
+                                    hx_target="#flowbite-table-body"
+                                )
+                            ),
+                            Li(
+                                A(
+                                    "1",
+                                    href="#",
+                                    cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                    hx_get="/api/classifications-page?page=1",
+                                    hx_target="#flowbite-table-body"
+                                )
+                            ),
+                            Li(
+                                A(
+                                    "2",
+                                    href="#",
+                                    cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                    hx_get="/api/classifications-page?page=2",
+                                    hx_target="#flowbite-table-body"
+                                )
+                            ),
+                            Li(
+                                A(
+                                    "3",
+                                    aria_current="page",
+                                    href="#",
+                                    cls="flex items-center justify-center px-3 h-8 text-blue-600 border border-gray-300 bg-blue-50 hover:bg-blue-100 hover:text-blue-700 dark:border-gray-700 dark:bg-gray-700 dark:text-white",
+                                    hx_get="/api/classifications-page?page=3",
+                                    hx_target="#flowbite-table-body"
+                                )
+                            ),
+                            Li(
+                                A(
+                                    "Next",
+                                    href="#",
+                                    cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 rounded-r-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                    hx_get="/api/classifications-page?page=next",
+                                    hx_target="#flowbite-table-body"
+                                )
+                            ),
+                            cls="inline-flex -space-x-px text-sm h-8"
+                        ),
+                        cls="flex items-center justify-between p-4",
+                        aria_label="Table navigation"
+                    ),
+                    
+                    cls="relative overflow-x-auto shadow-md sm:rounded-lg"
+                ),
+                
+                # Image Modal for Detail View
+                Div(
+                    Div(
+                        Div(
+                            H3("Classification Details", cls="text-lg leading-6 font-medium text-gray-900", id="modal-title"),
+                            Div(
+                                Div(
+                                    # Placeholder image
+                                    Svg(
+                                        Path(
+                                            stroke_linecap="round",
+                                            stroke_linejoin="round",
+                                            stroke_width="2",
+                                            d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                                        ),
+                                        id="modal-image-placeholder",
+                                        cls="h-48 w-48 text-gray-400",
+                                        fill="none",
+                                        viewBox="0 0 24 24",
+                                        stroke="currentColor"
+                                    ),
+                                    Img(
+                                        id="modal-image",
+                                        cls="max-h-64 hidden",
+                                        src="",
+                                        alt="Classification Image"
+                                    ),
+                                    cls="bg-gray-100 p-4 rounded-lg flex items-center justify-center"
+                                ),
+                                Div(
+                                    P(
+                                        Span("ID:", cls="font-semibold"),
+                                        Span(id="modal-id")
+                                    ),
+                                    P(
+                                        Span("Category:", cls="font-semibold"),
+                                        Span(id="modal-category")
+                                    ),
+                                    P(
+                                        Span("Confidence:", cls="font-semibold"),
+                                        Span(id="modal-confidence")
+                                    ),
+                                    P(
+                                        Span("Reference Source:", cls="font-semibold"),
+                                        Span(id="modal-source"),
+                                        id="modal-source-container",
+                                        cls="hidden"
+                                    ),
+                                    P(
+                                        Span("Description:", cls="font-semibold"),
+                                        Span(id="modal-description"),
+                                        id="modal-description-container",
+                                        cls="hidden"
+                                    ),
+                                    cls="mt-4 text-left"
+                                ),
+                                cls="mt-2 px-7 py-3"
+                            ),
+                            Div(
+                                Button(
+                                    "Close",
+                                    id="modal-close",
+                                    cls="px-4 py-2 bg-gray-500 text-white text-base font-medium rounded-md w-full shadow-sm hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300"
+                                ),
+                                cls="items-center px-4 py-3"
+                            ),
+                            cls="mt-3 text-center"
+                        ),
+                        cls="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white"
+                    ),
+                    id="image-modal",
+                    cls="fixed hidden inset-0 bg-black bg-opacity-50 overflow-y-auto h-full w-full z-50"
+                ),
+                
+                # Modal handling script
+                Script("""
+                // Modal handling functions
+                function showImageModal(id, category, confidence) {
+                    // Set modal content
+                    document.getElementById('modal-id').textContent = id;
+                    document.getElementById('modal-category').textContent = category;
+                    
+                    // Set confidence with appropriate color
+                    const confidenceEl = document.getElementById('modal-confidence');
+                    confidenceEl.textContent = confidence;
+                    confidenceEl.className = confidence === 'High' ? 'text-green-600' : 
+                                            confidence === 'Medium' ? 'text-yellow-600' : 'text-red-600';
+                    
+                    // Show modal
+                    document.getElementById('image-modal').classList.remove('hidden');
+                    
+                    // Optional: Fetch additional details with HTMX
+                    htmx.ajax('GET', '/api/classification-details/' + id, {target: '#modal-description-container'});
+                }
+                
+                // Close modal when close button is clicked
+                document.getElementById('modal-close').addEventListener('click', function() {
+                    document.getElementById('image-modal').classList.add('hidden');
+                });
+                
+                // Close modal when backdrop is clicked
+                document.getElementById('image-modal').addEventListener('click', function(e) {
+                    if (e.target === this) {
+                        this.classList.add('hidden');
+                    }
+                });
+                """),
+                
+                cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
+            )
+        
+        # Tables Section with Tab Navigation
+        tables_section = Div(
+            H2("Classification Results", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                # Tab navigation
+                Div(
+                    Div(
+                        Div(role="tablist", cls="tabs tabs-boxed bg-base-200 p-1 mb-6"),
+                        
+                        Button(
+                            "Recent Classifications", 
+                            cls="tab tab-active",
+                            id="tab-recent",
+                            onclick="showTab('recent')",
+                            role="tab",
+                            aria_selected="true"
+                        ),
+                        
+                        Button(
+                            "All Classifications", 
+                            cls="tab",
+                            id="tab-all",
+                            onclick="showTab('all')",
+                            role="tab",
+                            aria_selected="false"
+                        ),
+                        
+                        cls="flex justify-center"
+                    ),
+                    
+                    # Tab content containers
+                    Div(
+                        # DaisyUI Table Content
+                        Div(
+                            daisyui_table,
+                            id="tab-content-recent",
+                            cls="block"
+                        ),
+                        
+                        # Flowbite Table Content
+                        Div(
+                            flowbite_table,
+                            id="tab-content-all",
+                            cls="hidden"
+                        ),
+                        
+                        cls="w-full"
+                    ),
+                    
+                    # Simple tab switching script
+                    Script("""
+                    function showTab(tabName) {
+                        // Hide all tab contents
+                        document.getElementById('tab-content-recent').classList.add('hidden');
+                        document.getElementById('tab-content-all').classList.add('hidden');
+                        
+                        // Deactivate all tabs
+                        document.getElementById('tab-recent').classList.remove('tab-active');
+                        document.getElementById('tab-all').classList.remove('tab-active');
+                        
+                        // Show selected tab content
+                        document.getElementById('tab-content-' + tabName).classList.remove('hidden');
+                        
+                        // Activate selected tab
+                        document.getElementById('tab-' + tabName).classList.add('tab-active');
+                    }
+                    """),
+                    
+                    cls="w-full"
+                ),
+                cls="w-full"
+            ),
+            cls="mb-8"
+        )
+        
+        # Context Sources Section (for RAG stats)
+        rag_section = Div(
+            H2("RAG Context Usage", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    H3("Most Used Context Sources", cls="font-semibold mb-3"),
+                    Table(
+                        Thead(
+                            Tr(
+                                Th("Source"),
+                                Th("Usage Count"),
+                            )
+                        ),
+                        Tbody(
+                            *[
+                                Tr(
+                                    Td(source),
+                                    Td(str(count)),
+                                )
+                                for source, count in stats["context_counts"]
+                            ] if stats["context_counts"] else [
+                                Tr(
+                                    Td("No context sources recorded yet"),
+                                    Td("0")
+                                )
+                            ]
+                        ),
+                        cls="table w-full"
+                    ),
+                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="w-full"
+            ),
+            cls="mb-8"
+        )
+        
+        return Title("Dashboard - Insect Classifier"), Main(
+            Div(
+                H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
+                P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
+                navbar,
+                summary_cards,
+                charts_section,
+                confidence_feedback_section,
+                tables_section,
+                rag_section,
+                cls="container mx-auto px-4 py-8 max-w-7xl"
+            ),
+            cls="min-h-screen bg-base-100",
+            data_theme="light"
+        )
+
+#################################################
+    # API route for chart data
+    #################################################
+    @rt("/api/chart-data", methods=["GET"])
+    async def api_chart_data(request):
+        """API endpoint to get chart data for the donut chart"""
+        try:
+            # Get stats
+            stats = get_classification_stats()
+            
+            # Process the top categories
+            categories_to_display = stats["combined_category_counts"][:10]
+            
+            # Format the data for ApexCharts
+            labels = [category for category, _ in categories_to_display]
+            counts = [count for _, count in categories_to_display]
+            
+            # Return JSON data
+            return JSONResponse({
+                "labels": labels,
+                "counts": counts
+            })
+            
+        except Exception as e:
+            print(f"Error getting chart data: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    #################################################
+    # API route for activity chart data
+    #################################################
+    @rt("/api/chart-activity", methods=["GET"])
+    async def api_chart_activity(request):
+        """API endpoint to get activity data for the line chart"""
+        try:
+            # Get requested time range (default to 7 days)
+            range_days = int(request.query_params.get("range", 7))
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Get daily classification counts for the requested range
+            cursor.execute("""
+                SELECT DATE(created_at) as date, COUNT(*) as count 
+                FROM results 
+                WHERE created_at >= date('now', ?) 
+                GROUP BY DATE(created_at) 
+                ORDER BY date ASC
+            """, (f'-{range_days} days',))
+            
+            daily_data = cursor.fetchall()
+            
+            # Get total and calculate average
+            total_count = sum(count for _, count in daily_data)
+            avg_count = round(total_count / len(daily_data)) if daily_data else 0
+            
+            # Calculate trend (using simple percentage change)
+            trend = 0
+            if len(daily_data) >= 2:
+                first_half = sum(count for _, count in daily_data[:len(daily_data)//2])
+                second_half = sum(count for _, count in daily_data[len(daily_data)//2:])
+                
+                if first_half > 0:
+                    trend = round(((second_half - first_half) / first_half) * 100, 1)
+            
+            # Extract dates and counts
+            dates = [date for date, _ in daily_data]
+            counts = [count for _, count in daily_data]
+            
+            conn.close()
+            
+            # Return JSON data
+            return JSONResponse({
+                "dates": dates,
+                "counts": counts,
+                "total": total_count,
+                "average": avg_count,
+                "trend": trend
+            })
+            
+        except Exception as e:
+            print(f"Error getting activity data: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    #################################################
+    # API route for recent classifications
+    #################################################
+    @rt("/api/recent-classifications", methods=["GET"])
+    async def api_recent_classifications(request):
+        """API endpoint to get recent classification data for the table"""
+        try:
+            # Get limit parameter with default of 10
+            limit = int(request.query_params.get("limit", 10))
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Get recent classifications
+            cursor.execute("""
+                SELECT id, category, confidence, feedback, created_at, context_source 
+                FROM results 
+                ORDER BY created_at DESC 
+                LIMIT ?
+            """, (limit,))
+            
+            recent_classifications = cursor.fetchall()
+            conn.close()
+            
+            # Generate HTML for the table body
+            html = ""
+            for id, category, confidence, feedback, created_at, context_source in recent_classifications:
+                # Determine confidence class
+                confidence_class = 'badge-warning'
+                if confidence == 'High':
+                    confidence_class = 'badge-success'
+                elif confidence == 'Low':
+                    confidence_class = 'badge-error'
+                
+                # Build the table row
+                html += f"""
+                <tr class="hover">
+                    <td>
+                        <div class="avatar cursor-pointer" onclick="document.getElementById('modal-{id[:8]}').showModal()">
+                            <div class="mask mask-squircle w-12 h-12 bg-base-300 flex items-center justify-center">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-base-content/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                </svg>
+                            </div>
+                        </div>
+                        
+                        <dialog id="modal-{id[:8]}" class="modal">
+                            <div class="modal-box">
+                                <h3 class="font-bold text-lg mb-2">Classification: {category}</h3>
+                                <!-- Modal content -->
+                                <div class="modal-action">
+                                    <form method="dialog">
+                                        <button class="btn">Close</button>
+                                    </form>
+                                </div>
+                            </div>
+                            <form method="dialog" class="modal-backdrop">
+                                <button>close</button>
+                            </form>
+                        </dialog>
+                    </td>
+                    <td class="font-mono text-xs">{id[:8]}...</td>
+                    <td>{category}</td>
+                    <td>
+                        <span class="badge {confidence_class}">{confidence}</span>
+                    </td>
+                """
+                
+                # Feedback cell
+                if feedback:
+                    feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+                    html += f"""
+                    <td>
+                        <span class="badge {feedback_class}">{feedback}</span>
+                    </td>
+                    """
+                else:
+                    html += f"""
+                    <td>
+                        <div class="flex space-x-1">
+                            <button 
+                                class="btn btn-xs btn-circle btn-outline" 
+                                hx-post="/api/feedback"
+                                hx-vals='{{"id": "{id}", "feedback": "positive"}}'
+                                hx-swap="outerHTML"
+                                title="Positive Feedback">
+                                👍
+                            </button>
+                            <button 
+                                class="btn btn-xs btn-circle btn-outline" 
+                                hx-post="/api/feedback"
+                                hx-vals='{{"id": "{id}", "feedback": "negative"}}'
+                                hx-swap="outerHTML"
+                                title="Negative Feedback">
+                                👎
+                            </button>
+                        </div>
+                    </td>
+                    """
+                
+                # Context source and time
+                source_display = context_source if context_source else "None"
+                html += f"""
+                    <td class="max-w-xs truncate" title="{source_display}">{source_display}</td>
+                    <td>{created_at}</td>
+                    <td>
+                        <div class="dropdown dropdown-end">
+                            <label tabindex="0" class="btn btn-xs btn-ghost m-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z" />
+                                </svg>
+                            </label>
+                            <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+                                <li><a onclick="document.getElementById('modal-{id[:8]}').showModal()">View Details</a></li>
+                                <li><a hx-get="/export-result?id={id}" hx-trigger="click" hx-swap="none">Export Result</a></li>
+                            </ul>
+                        </div>
+                    </td>
+                </tr>
+                """
+            
+            # Return the HTML directly for HTMX to swap
+            return HTMLResponse(html)
+            
+        except Exception as e:
+            print(f"Error getting recent classifications: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <tr>
+                <td colspan="8" class="text-center text-error">
+                    Error loading data: {str(e)}
+                </td>
+            </tr>
+            """)
+
+    #################################################
+    # API route for feedback submission
+    #################################################
+    @rt("/api/feedback", methods=["POST"])
+    async def api_submit_feedback(request):
+        """API endpoint to submit feedback for a classification"""
+        try:
+            # Get form data
+            form_data = await request.form()
+            result_id = form_data.get("id")
+            feedback = form_data.get("feedback")
+            
+            if not result_id or not feedback:
+                return HTMLResponse("""
+                <div class="text-error">Error: Missing parameters</div>
+                """, status_code=400)
+            
+            # Validate feedback type
+            if feedback not in ["positive", "negative"]:
+                return HTMLResponse("""
+                <div class="text-error">Error: Invalid feedback type</div>
+                """, status_code=400)
+            
+            # Update the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Update the record
+            cursor.execute(
+                "UPDATE results SET feedback = ? WHERE id = ?",
+                (feedback, result_id)
+            )
+            
+            # Check if any row was affected
+            if cursor.rowcount == 0:
+                # Try batch results table
+                cursor.execute(
+                    "SELECT batch_id, results FROM batch_results WHERE batch_id = ? OR batch_id = SUBSTR(?, 1, INSTR(?, '_') - 1)",
+                    (result_id, result_id, result_id)
+                )
+                batch_result = cursor.fetchone()
+                
+                if batch_result:
+                    batch_id, results_json = batch_result
+                    
+                    # Parse the results JSON
+                    results_data = json.loads(results_json)
+                    
+                    # Find the specific result in the batch
+                    for result in results_data:
+                        if result.get("id") == result_id:
+                            # Update the feedback
+                            result["feedback"] = feedback
+                            break
+                    
+                    # Save the updated results back to the database
+                    cursor.execute(
+                        "UPDATE batch_results SET results = ? WHERE batch_id = ?",
+                        (json.dumps(results_data), batch_id)
+                    )
+            
+            conn.commit()
+            conn.close()
+            
+            # Return updated feedback pill/badge
+            feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+            return HTMLResponse(f"""
+            <span class="badge {feedback_class}">{feedback}</span>
+            """)
+            
+        except Exception as e:
+            print(f"Error submitting feedback: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <div class="text-error">Error: {str(e)}</div>
+            """, status_code=500)
+        
+#################################################
+    # API route for searching classifications
+    #################################################
+    @rt("/api/search-classifications", methods=["POST"])
+    async def api_search_classifications(request):
+        """API endpoint to search classifications"""
+        try:
+            # Get form data
+            form_data = await request.form()
+            search_query = form_data.get("classification-search", "").strip()
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Build the query
+            query = """
+                SELECT id, category, confidence, feedback, created_at, context_source 
+                FROM results 
+                WHERE 1=1
+            """
+            params = []
+            
+            # Add search conditions if query is provided
+            if search_query:
+                query += """
+                    AND (
+                        category LIKE ? OR
+                        description LIKE ? OR
+                        id LIKE ? OR
+                        context_source LIKE ?
+                    )
+                """
+                search_param = f"%{search_query}%"
+                params.extend([search_param, search_param, search_param, search_param])
+            
+            # Add order and limit
+            query += " ORDER BY created_at DESC LIMIT 20"
+            
+            # Execute the query
+            cursor.execute(query, params)
+            search_results = cursor.fetchall()
+            conn.close()
+            
+            # Generate HTML for table rows
+            html = generate_flowbite_table_rows(search_results)
+            
+            return HTMLResponse(html)
+            
+        except Exception as e:
+            print(f"Error searching classifications: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <tr>
+                <td colspan="6" class="px-6 py-4 text-center text-red-500">
+                    Error searching data: {str(e)}
+                </td>
+            </tr>
+            """)
+
+    #################################################
+    # API route for filtering classifications
+    #################################################
+    @rt("/api/filter-classifications", methods=["POST"])
+    async def api_filter_classifications(request):
+        """API endpoint to filter classifications by category"""
+        try:
+            # Get form data
+            form_data = await request.form()
+            category = form_data.get("value", "").strip()
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Build the query
+            query = """
+                SELECT id, category, confidence, feedback, created_at, context_source 
+                FROM results 
+                WHERE 1=1
+            """
+            params = []
+            
+            # Add category filter if provided
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+            
+            # Add order and limit
+            query += " ORDER BY created_at DESC LIMIT 20"
+            
+            # Execute the query
+            cursor.execute(query, params)
+            filter_results = cursor.fetchall()
+            conn.close()
+            
+            # Generate HTML for table rows
+            html = generate_flowbite_table_rows(filter_results)
+            
+            return HTMLResponse(html)
+            
+        except Exception as e:
+            print(f"Error filtering classifications: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <tr>
+                <td colspan="6" class="px-6 py-4 text-center text-red-500">
+                    Error filtering data: {str(e)}
+                </td>
+            </tr>
+            """)
+
+    #################################################
+    # API route for sorting classifications
+    #################################################
+    @rt("/api/sort-classifications", methods=["GET"])
+    async def api_sort_classifications(request):
+        """API endpoint to sort classifications"""
+        try:
+            # Get query parameters
+            field = request.query_params.get("field", "date")
+            direction = request.query_params.get("dir", "desc")
+            
+            # Map field names to database columns
+            field_mapping = {
+                "category": "category",
+                "confidence": "confidence",
+                "date": "created_at"
+            }
+            
+            # Validate parameters
+            if field not in field_mapping:
+                field = "date"
+            
+            if direction not in ["asc", "desc"]:
+                direction = "desc"
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Build and execute query
+            query = f"""
+                SELECT id, category, confidence, feedback, created_at, context_source 
+                FROM results 
+                ORDER BY {field_mapping[field]} {direction.upper()}
+                LIMIT 20
+            """
+            
+            cursor.execute(query)
+            sorted_results = cursor.fetchall()
+            conn.close()
+            
+            # Generate HTML for table rows
+            html = generate_flowbite_table_rows(sorted_results)
+            
+            return HTMLResponse(html)
+            
+        except Exception as e:
+            print(f"Error sorting classifications: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <tr>
+                <td colspan="6" class="px-6 py-4 text-center text-red-500">
+                    Error sorting data: {str(e)}
+                </td>
+            </tr>
+            """)
+
+    #################################################
+    # API route for pagination
+    #################################################
+    @rt("/api/classifications-page", methods=["GET"])
+    async def api_classifications_page(request):
+        """API endpoint to get a specific page of classification results"""
+        try:
+            # Get page parameter
+            page = request.query_params.get("page", "1")
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Calculate offset based on page
+            per_page = 10
+            
+            if page == "prev":
+                # We don't know the current page, so just return the first page
+                offset = 0
+            elif page == "next":
+                # Similar challenge, let's assume we're on page 1
+                offset = per_page
+            else:
+                try:
+                    page_num = int(page)
+                    offset = (page_num - 1) * per_page
+                except ValueError:
+                    offset = 0
+            
+            # Get paginated results
+            cursor.execute("""
+                SELECT id, category, confidence, feedback, created_at, context_source 
+                FROM results 
+                ORDER BY created_at DESC 
+                LIMIT ? OFFSET ?
+            """, (per_page, offset))
+            
+            page_results = cursor.fetchall()
+            conn.close()
+            
+            # Generate HTML for table rows
+            html = generate_flowbite_table_rows(page_results)
+            
+            return HTMLResponse(html)
+            
+        except Exception as e:
+            print(f"Error getting page data: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <tr>
+                <td colspan="6" class="px-6 py-4 text-center text-red-500">
+                    Error loading page data: {str(e)}
+                </td>
+            </tr>
+            """)
+
+#################################################
+    # API route for classification details
+    #################################################
+    @rt("/api/classification-details/{result_id}", methods=["GET"])
+    async def api_classification_details(request):
+        """API endpoint to get detailed information about a specific classification"""
+        try:
+            # Get result ID from path parameter
+            result_id = request.path_params["result_id"]
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Get classification details
+            cursor.execute("""
+                SELECT id, category, confidence, description, additional_details, context_source 
+                FROM results 
+                WHERE id = ?
+            """, (result_id,))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if not result:
+                return HTMLResponse("""
+                <div class="mt-4">
+                    <p class="text-red-500">Classification not found</p>
+                </div>
+                """, status_code=404)
+            
+            # Extract data
+            id, category, confidence, description, additional_details, context_source = result
+            
+            # Build response HTML
+            html = f"""
+            <div class="block mt-4">
+                <span class="font-semibold">Description:</span>
+                <p class="mt-1">{description}</p>
+            </div>
+            """
+            
+            # Add additional details if available
+            if additional_details:
+                try:
+                    details = json.loads(additional_details)
+                    html += '<div class="mt-3">'
+                    for key, value in details.items():
+                        if key not in ["Main Category", "Confidence", "Description"]:
+                            html += f'<p><span class="font-semibold">{key}:</span> {value}</p>'
+                    html += '</div>'
+                except:
+                    pass
+            
+            # Add context source if available
+            if context_source:
+                html += f"""
+                <div class="mt-3" id="modal-source-container">
+                    <span class="font-semibold">Reference Source:</span> 
+                    <span id="modal-source">{context_source}</span>
+                </div>
+                """
+            
+            return HTMLResponse(html)
+            
+        except Exception as e:
+            print(f"Error getting classification details: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <div class="mt-4">
+                <p class="text-red-500">Error loading details: {str(e)}</p>
+            </div>
+            """, status_code=500)
+
+    #################################################
+    # API route for exporting results
+    #################################################
+    @rt("/export-result", methods=["GET"])
+    async def api_export_result(request):
+        """API endpoint to export a classification result as JSON"""
+        try:
+            # Get result ID from query parameter
+            result_id = request.query_params.get("id")
+            
+            if not result_id:
+                return JSONResponse({"error": "Missing result ID"}, status_code=400)
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Get result data
+            cursor.execute("""
+                SELECT id, category, confidence, description, additional_details, context_source, created_at, feedback
+                FROM results 
+                WHERE id = ?
+            """, (result_id,))
+            
+            result = cursor.fetchone()
+            
+            if not result:
+                # Check batch results
+                cursor.execute("""
+                    SELECT results
+                    FROM batch_results
+                    WHERE batch_id = ? OR batch_id = SUBSTR(?, 1, INSTR(?, '_') - 1)
+                """, (result_id, result_id, result_id))
+                
+                batch_result = cursor.fetchone()
+                
+                if batch_result:
+                    batch_data = json.loads(batch_result[0])
+                    for item in batch_data:
+                        if item.get("id") == result_id:
+                            # Format the result
+                            export_data = {
+                                "id": item.get("id"),
+                                "category": item.get("category"),
+                                "confidence": item.get("confidence"),
+                                "description": item.get("description"),
+                                "details": item.get("details", {}),
+                                "feedback": item.get("feedback"),
+                                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                            
+                            # Set content disposition to trigger download
+                            headers = {
+                                "Content-Disposition": f"attachment; filename=classification_{result_id[:8]}.json"
+                            }
+                            
+                            return JSONResponse(export_data, headers=headers)
+                
+                return JSONResponse({"error": "Result not found"}, status_code=404)
+            
+            # Extract data
+            id, category, confidence, description, additional_details, context_source, created_at, feedback = result
+            
+            # Parse additional details
+            details = {}
+            if additional_details:
+                try:
+                    details = json.loads(additional_details)
+                except:
+                    details = {"raw": additional_details}
+            
+            # Format the result
+            export_data = {
+                "id": id,
+                "category": category,
+                "confidence": confidence,
+                "description": description,
+                "details": details,
+                "context_source": context_source,
+                "created_at": created_at,
+                "feedback": feedback,
+                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # Set content disposition to trigger download
+            headers = {
+                "Content-Disposition": f"attachment; filename=classification_{result_id[:8]}.json"
+            }
+            
+            return JSONResponse(export_data, headers=headers)
+            
+        except Exception as e:
+            print(f"Error exporting result: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+#################################################
+    # Image serving routes
+    #################################################
+    @rt("/image-thumbnail", methods=["GET"])
+    async def serve_image_thumbnail(request):
+        """Serve a thumbnail image for classifications"""
+        try:
+            # Get the image path from query parameters
+            image_path = request.query_params.get("path", "")
+            
+            if not image_path or not os.path.exists(image_path):
+                # Return a placeholder SVG if no image is found
+                placeholder_svg = """
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                    <polyline points="21 15 16 10 5 21"></polyline>
+                </svg>
+                """
+                return Response(
+                    content=placeholder_svg.encode("utf-8"),
+                    media_type="image/svg+xml"
+                )
+            
+            # Get the file extension to determine content type
+            _, ext = os.path.splitext(image_path.lower())
+            
+            # Set content type based on extension
+            if ext in ['.jpg', '.jpeg']:
+                content_type = "image/jpeg"
+            elif ext == '.png':
+                content_type = "image/png"
+            elif ext == '.gif':
+                content_type = "image/gif"
+            elif ext == '.svg':
+                content_type = "image/svg+xml"
+            else:
+                content_type = "application/octet-stream"
+            
+            # Read the file
+            with open(image_path, "rb") as f:
+                content = f.read()
+            
+            # Return the image
+            return Response(
+                content=content,
+                media_type=content_type
+            )
+            
+        except Exception as e:
+            print(f"Error serving image: {e}")
+            traceback.print_exc()
+            
+            # Return a placeholder SVG if there's an error
+            placeholder_svg = """
+            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="8" x2="12" y2="12"></line>
+                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            """
+            return Response(
+                content=placeholder_svg.encode("utf-8"),
+                media_type="image/svg+xml"
+            )
+
+    @rt("/context-image-thumbnail", methods=["GET"])
+    async def serve_context_image_thumbnail(request):
+        """Serve a thumbnail of context images from the RAG system"""
+        try:
+            # Get source ID from query parameters
+            source_id = request.query_params.get("source", "")
+            
+            if not source_id:
+                return Response(status_code=400)
+            
+            # Parse source ID to get filename and page
+            parts = source_id.split(", page ")
+            if len(parts) != 2:
+                return Response(status_code=400)
+            
+            filename = parts[0]
+            try:
+                page_num = int(parts[1])
+            except ValueError:
+                page_num = 1
+            
+            # Construct image path based on patterns used in the system
+            potential_paths = []
+            
+            # Try to find PDF image directory
+            pdf_name = os.path.splitext(filename)[0]  # Remove extension
+            
+            # Check different potential locations
+            pdf_dir = os.path.join(PDF_IMAGES_DIR, pdf_name)
+            if os.path.exists(pdf_dir) and os.path.isdir(pdf_dir):
+                # PDF directory found, look for page image
+                potential_paths.extend([
+                    os.path.join(pdf_dir, f"{page_num-1}.png"),  # 0-indexed
+                    os.path.join(pdf_dir, f"{page_num}.png"),    # 1-indexed
+                    os.path.join(pdf_dir, f"page_{page_num-1}.png"),
+                    os.path.join(pdf_dir, f"page_{page_num}.png")
+                ])
+            
+            # Also check direct file paths
+            potential_paths.extend([
+                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_{page_num-1}.png"),
+                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_{page_num}.png"),
+                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_page{page_num-1}.png"),
+                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_page{page_num}.png")
+            ])
+            
+            # Try all potential paths
+            image_path = None
+            for path in potential_paths:
+                if os.path.exists(path):
+                    image_path = path
+                    break
+            
+            if not image_path:
+                # Return a placeholder SVG
+                placeholder_svg = """
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                    <line x1="10" y1="9" x2="8" y2="9"></line>
+                </svg>
+                """
+                return Response(
+                    content=placeholder_svg.encode("utf-8"),
+                    media_type="image/svg+xml"
+                )
+            
+            # Read the image file
+            with open(image_path, "rb") as f:
+                content = f.read()
+            
+            # Return the image
+            return Response(
+                content=content,
+                media_type="image/png"
+            )
+            
+        except Exception as e:
+            print(f"Error serving context image: {e}")
+            traceback.print_exc()
+            
+            # Return a placeholder SVG if there's an error
+            placeholder_svg = """
+            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="8" x2="12" y2="12"></line>
+                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            """
+            return Response(
+                content=placeholder_svg.encode("utf-8"),
+                media_type="image/svg+xml"
+            )
+#################################################
+    # API route for image classification - FIXED FOR ASYNC/AWAIT ISSUE
+    #################################################
+    @rt("/classify", methods=["POST"])
+    async def api_classify_image(request):
+        """API endpoint to classify insect image using Claude with RAG"""
+        try:
+            # Get image data and options from request JSON
+            data = await request.json()
+            image_data = data.get("image_data", "")
+            options = data.get("options", {})
+            
+            if not image_data:
+                return JSONResponse({"error": "No image data provided"}, status_code=400)
+            
+            result = classify_image_claude.remote(image_data, options)
+            
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error classifying image: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    #################################################
+    # Batch Classify API Endpoint
+    #################################################
+    @rt("/classify-batch", methods=["POST"])
+    async def api_classify_batch(request):
+        """API endpoint to classify multiple insect images in batch mode with RAG"""
+        try:
+            # Get form data with files
+            form = await request.form()
+            options_json = form.get("options", "{}")
+            options = json.loads(options_json)
+            
+            # Extract image files
+            image_files = []
+            for key in form.keys():
+                if key.startswith("image_"):
+                    image_files.append(form.get(key))
+                    
+            if not image_files:
+                return JSONResponse({"error": "No images provided"}, status_code=400)
+                
+            # Limit to 5 images
+            if len(image_files) > 5:
+                image_files = image_files[:5]
+                
+            # Process each image
+            base64_images = []
+            for file in image_files:
+                # Read file content
+                content = await file.read()
+                
+                # Convert to base64
+                base64_data = base64.b64encode(content).decode("utf-8")
+                base64_images.append(base64_data)
+                
+            if not base64_images:
+                return JSONResponse({"error": "Failed to process images"}, status_code=400)
+                
+            result = classify_batch_claude.remote(base64_images, options)
+            
+            # Return the result
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error in batch classification: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+
     #################################################
     # Homepage Route - Unified Classifier Dashboard
     #################################################
@@ -1431,7 +3670,7 @@ def serve():
             ),
             Div(
                 P("Upload image(s) and click 'Classify Insects' to see results.", 
-                  cls="text-center text-base-content/70 italic"),
+                cls="text-center text-base-content/70 italic"),
                 id="results-placeholder",
                 cls="text-center py-12"
             ),
@@ -1678,7 +3917,7 @@ def serve():
                         
                         // Create remove button
                         const removeBtn = document.createElement('div');
-                             removeBtn.className = 'remove-btn';
+                            removeBtn.className = 'remove-btn';
                         removeBtn.innerHTML = '×';
                         removeBtn.onclick = function() {
                             // Remove this file
@@ -2296,635 +4535,7 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-    
-    #################################################
-    # Dashboard Route - Enhanced with Context Stats
-    #################################################
-    @rt("/dashboard")
-    def dashboard():
-        """Render the insect classification dashboard with RAG stats and pie chart"""
-        stats = get_classification_stats()
-        
-        # Import the Charts.css stylesheet
-        charts_css = Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/charts.css/dist/charts.min.css")
-        
-        # Create navigation bar (same as homepage)
-        navbar = Div(
-            Div(
-                A(
-                    Span("🐝", cls="text-xl"),
-                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
-                    href="/",
-                    cls="flex items-center"
-                ),
-                Div(
-                    A(
-                        "Dashboard",
-                        href="/dashboard",
-                        cls="btn btn-sm btn-ghost btn-active"
-                    ),
-                    A(
-                        "Classifier",
-                        href="/",
-                        cls="btn btn-sm btn-ghost"
-                    ),
-                    cls="flex-none"
-                ),
-                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
-            ),
-            cls="w-full"
-        )
-        
-        # Stats summary cards section
-        summary_cards = Div(
-            Div(
-                Div(
-                    Div(
-                        H3("Total Classifications", cls="font-bold text-lg"),
-                        P(str(stats["total"]), cls="text-4xl font-semibold text-primary"),
-                        cls="p-6"
-                    ),
-                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
-                ),
-                Div(
-                    Div(
-                        H3("Single Images", cls="font-bold text-lg"),
-                        P(str(stats["total_single"]), cls="text-3xl font-semibold"),
-                        cls="p-6"
-                    ),
-                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
-                ),
-                Div(
-                    Div(
-                        H3("Batch Images", cls="font-bold text-lg"),
-                        P(str(stats["total_batch"]), cls="text-3xl font-semibold"),
-                        cls="p-6"
-                    ),
-                    cls="bg-base-100 rounded-lg shadow-md border custom-border"
-                ),
-                cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
-            ),
-            cls="mb-8"
-        )
-        
-        # Categories Section with Pie Chart
-        # Calculate the total for percentage calculations
-        total_insects = sum(count for _, count in stats["combined_category_counts"])
-        
-        # Prepare data for the pie chart - we'll use the top 10 categories
-        pie_data = []
-        start_value = 0.0
-        
-        # Process top 10 categories or all if less than 10
-        categories_to_display = stats["combined_category_counts"][:10]
-        
-        for category, count in categories_to_display:
-            percentage = count / total_insects if total_insects > 0 else 0
-            end_value = start_value + percentage
-            
-            pie_data.append({
-                "category": category,
-                "count": count,
-                "percentage": percentage * 100,  # Convert to percentage
-                "start": start_value,
-                "end": end_value
-            })
-            
-            start_value = end_value
-        
-        # Create table rows for pie chart
-        pie_rows = []
-        for data in pie_data:
-            # Create a table row with styling for the pie chart segment
-            # Format percentages to 1 decimal place
-            pie_rows.append(
-                Tr(
-                    Td(
-                        Span(f"{data['category']}: {data['percentage']:.1f}%", cls="data"),
-                        style=f"--start: {data['start']}; --end: {data['end']};"
-                    )
-                )
-            )
-        
-        # Build the pie chart using Charts.css
-        pie_chart = Div(
-            H3("Insect Category Distribution", cls="font-semibold mb-3 text-center"),
-            Div(
-                Table(
-                    Caption("Category Distribution"),
-                    Tbody(*pie_rows),
-                    cls="charts-css pie show-labels"
-                ),
-                cls="mx-auto w-64 h-64"  # Set dimensions of the chart
-            ),
-            # Add a legend for the pie chart
-            Div(
-                *[
-                    Div(
-                        Span(cls="w-3 h-3 inline-block mr-1", 
-                            style=f"background-color: var(--color-{i+1});"),
-                        Span(f"{data['category']} ({data['count']})", cls="text-sm"),
-                        cls="mb-1"
-                    )
-                    for i, data in enumerate(pie_data)
-                ],
-                cls="mt-4 text-center grid grid-cols-2 gap-2"
-            ),
-            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
-        )
-        
-        # Modified categories section to include pie chart
-        categories_section = Div(
-            H2("Classification Categories", cls="text-xl font-bold mb-4 text-bee-green"),
-            Div(
-                Div(
-                    pie_chart,  # Add the pie chart here
-                    cls="w-full md:w-2/5"
-                ),
-                Div(
-                    H3("Distribution by Category", cls="font-semibold mb-3"),
-                    Table(
-                        Thead(
-                            Tr(
-                                Th("Category"),
-                                Th("Count"),
-                                Th("Percentage"),
-                            )
-                        ),
-                        Tbody(
-                            *[
-                                Tr(
-                                    Td(category),
-                                    Td(str(count)),
-                                    Td(f"{count / max(stats['total'], 1) * 100:.1f}%"),
-                                )
-                                for category, count in stats["combined_category_counts"][:10]
-                            ]
-                        ),
-                        cls="table table-zebra w-full"
-                    ),
-                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border w-full md:w-3/5"
-                ),
-                cls="flex flex-col md:flex-row gap-6 w-full"
-            ),
-            cls="mb-8"
-        )
-        
-        # Confidence & Feedback Section
-        confidence_feedback_section = Div(
-            Div(
-                Div(
-                    H3("Confidence Levels", cls="font-semibold mb-3"),
-                    Table(
-                        Thead(
-                            Tr(
-                                Th("Confidence"),
-                                Th("Count"),
-                            )
-                        ),
-                        Tbody(
-                            *[
-                                Tr(
-                                    Td(
-                                        Span(
-                                            confidence,
-                                            cls=f"badge {'badge-success' if confidence == 'High' else 'badge-warning' if confidence == 'Medium' else 'badge-error'}"
-                                        )
-                                    ),
-                                    Td(str(count)),
-                                )
-                                for confidence, count in stats["confidence_counts"]
-                            ]
-                        ),
-                        cls="table w-full"
-                    ),
-                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
-                ),
-                Div(
-                    H3("User Feedback", cls="font-semibold mb-3"),
-                    Table(
-                        Thead(
-                            Tr(
-                                Th("Feedback"),
-                                Th("Count"),
-                            )
-                        ),
-                        Tbody(
-                            *[
-                                Tr(
-                                    Td(
-                                        Span(
-                                            feedback,
-                                            cls=f"badge {'badge-success' if feedback == 'positive' else 'badge-error'}"
-                                        )
-                                    ),
-                                    Td(str(count)),
-                                )
-                                for feedback, count in stats["feedback_counts"]
-                            ] if stats["feedback_counts"] else [
-                                Tr(
-                                    Td("No feedback yet"),
-                                    Td("0")
-                                )
-                            ]
-                        ),
-                        cls="table w-full"
-                    ),
-                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
-                ),
-                cls="grid grid-cols-1 md:grid-cols-2 gap-6"
-            ),
-            cls="mb-8"
-        )
-        
-        # Recent Classifications Section
-        recent_classifications_section = Div(
-            H2("Recent Classifications", cls="text-xl font-bold mb-4 text-bee-green"),
-            Div(
-                Table(
-                    Thead(
-                        Tr(
-                            Th("ID"),
-                            Th("Category"),
-                            Th("Confidence"),
-                            Th("Feedback"),
-                            Th("Source"),
-                            Th("Time"),
-                        )
-                    ),
-                    Tbody(
-                        *[
-                            Tr(
-                                Td(id[:8] + "..."),
-                                Td(category),
-                                Td(
-                                    Span(
-                                        confidence,
-                                        cls=f"badge {'badge-success' if confidence == 'High' else 'badge-warning' if confidence == 'Medium' else 'badge-error'}"
-                                    )
-                                ),
-                                Td(
-                                    Span(
-                                        feedback if feedback else "None",
-                                        cls=f"{'badge badge-success' if feedback == 'positive' else 'badge badge-error' if feedback == 'negative' else ''}"
-                                    )
-                                ),
-                                Td(context_source if context_source else "None"),
-                                Td(created_at),
-                            )
-                            for id, category, confidence, feedback, created_at, context_source in stats["recent_classifications"]
-                        ]
-                    ),
-                    cls="table table-zebra w-full"
-                ),
-                cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border overflow-x-auto"
-            ),
-            cls="mb-8"
-        )
-        
-        # Context Sources Section (for RAG stats)
-        rag_section = Div(
-            H2("RAG Context Usage", cls="text-xl font-bold mb-4 text-bee-green"),
-            Div(
-                Div(
-                    H3("Most Used Context Sources", cls="font-semibold mb-3"),
-                    Table(
-                        Thead(
-                            Tr(
-                                Th("Source"),
-                                Th("Usage Count"),
-                            )
-                        ),
-                        Tbody(
-                            *[
-                                Tr(
-                                    Td(source),
-                                    Td(str(count)),
-                                )
-                                for source, count in stats["context_counts"]
-                            ] if stats["context_counts"] else [
-                                Tr(
-                                    Td("No context sources recorded yet"),
-                                    Td("0")
-                                )
-                            ]
-                        ),
-                        cls="table w-full"
-                    ),
-                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
-                ),
-                cls="w-full"
-            ),
-            cls="mb-8"
-        )
-        
-        # Daily Classification Activity
-        daily_activity_section = ""
-        if stats["daily_counts"]:
-            daily_activity_section = Div(
-                H2("Daily Classification Activity", cls="text-xl font-bold mb-4 text-bee-green"),
-                Div(
-                    Table(
-                        Thead(
-                            Tr(
-                                Th("Date"),
-                                Th("Classifications"),
-                            )
-                        ),
-                        Tbody(
-                            *[
-                                Tr(
-                                    Td(date),
-                                    Td(str(count)),
-                                )
-                                for date, count in stats["daily_counts"]
-                            ]
-                        ),
-                        cls="table table-zebra w-full"
-                    ),
-                    cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border"
-                ),
-                cls="mb-8"
-            )
-        
-        # Add custom CSS for the pie chart colors
-        pie_chart_styles = Style("""
-            /* Pie chart colors */
-            .charts-css.pie tbody tr:nth-child(1) {
-                --color: var(--color-primary);
-            }
-            .charts-css.pie tbody tr:nth-child(2) {
-                --color: var(--color-secondary);
-            }
-            .charts-css.pie tbody tr:nth-child(3) {
-                --color: var(--color-accent);
-            }
-            .charts-css.pie tbody tr:nth-child(4) {
-                --color: #1e88e5;
-            }
-            .charts-css.pie tbody tr:nth-child(5) {
-                --color: #43a047;
-            }
-            .charts-css.pie tbody tr:nth-child(6) {
-                --color: #ffb300;
-            }
-            .charts-css.pie tbody tr:nth-child(7) {
-                --color: #e53935;
-            }
-            .charts-css.pie tbody tr:nth-child(8) {
-                --color: #8e24aa;
-            }
-            .charts-css.pie tbody tr:nth-child(9) {
-                --color: #00acc1;
-            }
-            .charts-css.pie tbody tr:nth-child(10) {
-                --color: #f4511e;
-            }
-            
-            /* Legend color boxes */
-            [style*="--color-1"] {
-                background-color: var(--color-primary);
-            }
-            [style*="--color-2"] {
-                background-color: var(--color-secondary);
-            }
-            [style*="--color-3"] {
-                background-color: var(--color-accent);
-            }
-            [style*="--color-4"] {
-                background-color: #1e88e5;
-            }
-            [style*="--color-5"] {
-                background-color: #43a047;
-            }
-            [style*="--color-6"] {
-                background-color: #ffb300;
-            }
-            [style*="--color-7"] {
-                background-color: #e53935;
-            }
-            [style*="--color-8"] {
-                background-color: #8e24aa;
-            }
-            [style*="--color-9"] {
-                background-color: #00acc1;
-            }
-            [style*="--color-10"] {
-                background-color: #f4511e;
-            }
-            
-            /* Improve Charts.css styling for our theme */
-            .charts-css.pie {
-                --chart-bg: transparent;
-                height: 250px;
-                max-width: 250px;
-                margin: 0 auto;
-            }
-            
-            .charts-css.pie .data {
-                font-size: 10px;
-                color: transparent;
-            }
-            
-            .charts-css caption {
-                margin-bottom: 1rem;
-                font-weight: bold;
-            }
-        """)
-        
-        return Title("Dashboard - Insect Classifier"), Main(
-            charts_css,  # Add the Charts.css stylesheet
-            pie_chart_styles,  # Add custom styles for the pie chart
-            Div(
-                H1("Classification Dashboard", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
-                P("Statistics and insights from the Insect Classifier with RAG", cls="text-center mb-8 text-base-content/70"),
-                navbar,
-                summary_cards,
-                categories_section,  # Updated to include pie chart
-                confidence_feedback_section,
-                recent_classifications_section,
-                rag_section,
-                daily_activity_section,
-                cls="container mx-auto px-4 py-8 max-w-7xl"
-            ),
-            cls="min-h-screen bg-base-100",
-            data_theme="light"
-        )
-    
-    #################################################
-    # API route for image classification - FIXED FOR ASYNC/AWAIT ISSUE
-    #################################################
-    @rt("/classify", methods=["POST"])
-    async def api_classify_image(request):
-        """API endpoint to classify insect image using Claude with RAG"""
-        try:
-            # Get image data and options from request JSON
-            data = await request.json()
-            image_data = data.get("image_data", "")
-            options = data.get("options", {})
-            
-            if not image_data:
-                return JSONResponse({"error": "No image data provided"}, status_code=400)
-            
-            result = classify_image_claude.remote(image_data, options)
-            
-            return JSONResponse(result)
-                
-        except Exception as e:
-            print(f"Error classifying image: {e}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-    
-    #################################################
-    # Batch Classify API Endpoint - FIXED
-    #################################################
-    @rt("/classify-batch", methods=["POST"])
-    async def api_classify_batch(request):
-        """API endpoint to classify multiple insect images in batch mode with RAG"""
-        try:
-            # Get form data with files
-            form = await request.form()
-            options_json = form.get("options", "{}")
-            options = json.loads(options_json)
-            
-            # Extract image files
-            image_files = []
-            for key in form.keys():
-                if key.startswith("image_"):
-                    image_files.append(form.get(key))
-                    
-            if not image_files:
-                return JSONResponse({"error": "No images provided"}, status_code=400)
-                
-            # Limit to 5 images
-            if len(image_files) > 5:
-                image_files = image_files[:5]
-                
-            # Process each image
-            base64_images = []
-            for file in image_files:
-                # Read file content
-                content = await file.read()
-                
-                # Convert to base64
-                base64_data = base64.b64encode(content).decode("utf-8")
-                base64_images.append(base64_data)
-                
-            if not base64_images:
-                return JSONResponse({"error": "Failed to process images"}, status_code=400)
-                
-            result = classify_batch_claude.remote(base64_images, options)
-            
-            # Return the result
-            return JSONResponse(result)
-                
-        except Exception as e:
-            print(f"Error in batch classification: {e}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-    
-    #################################################
-    # API route for saving feedback
-    #################################################
-    @rt("/api/feedback", methods=["POST"])
-    async def api_save_feedback(request):
-        """API endpoint to save user feedback on classification results"""
-        try:
-            # Get feedback data from request JSON
-            data = await request.json()
-            result_id = data.get("id", "")
-            feedback = data.get("feedback", "")
-            
-            if not result_id or not feedback:
-                return JSONResponse({"error": "Missing required parameters"}, status_code=400)
-            
-            # Validate feedback type
-            if feedback not in ["positive", "negative"]:
-                return JSONResponse({"error": "Invalid feedback type"}, status_code=400)
-            
-            # Save feedback to database
-            try:
-                conn = sqlite3.connect(DB_PATH, timeout=30.0)
-                cursor = conn.cursor()
-                
-                # Update the feedback column for the specific result
-                cursor.execute(
-                    "UPDATE results SET feedback = ? WHERE id = ?",
-                    (feedback, result_id)
-                )
-                
-                # Check if any row was affected
-                if cursor.rowcount == 0:
-                    # Try to find the result in batch_results table
-                    cursor.execute(
-                        "SELECT batch_id, results FROM batch_results WHERE batch_id = ? OR batch_id = SUBSTR(?, 1, INSTR(?, '_') - 1)",
-                        (result_id, result_id, result_id)
-                    )
-                    batch_result = cursor.fetchone()
-                    
-                    if batch_result:
-                        batch_id, results_json = batch_result
-                        
-                        # Parse the results JSON
-                        results_data = json.loads(results_json)
-                        
-                        # Find the specific result in the batch
-                        for result in results_data:
-                            if result.get("id") == result_id:
-                                # Update the feedback
-                                result["feedback"] = feedback
-                                break
-                        
-                        # Save the updated results back to the database
-                        cursor.execute(
-                            "UPDATE batch_results SET results = ? WHERE batch_id = ?",
-                            (json.dumps(results_data), batch_id)
-                        )
-                
-                conn.commit()
-                conn.close()
-                
-                return JSONResponse({"success": True, "id": result_id, "feedback": feedback})
-                
-            except Exception as e:
-                print(f"⚠️ Error saving feedback to database: {e}")
-                return JSONResponse({"error": str(e)}, status_code=500)
-                    
-        except Exception as e:
-            print(f"Error processing feedback: {e}")
-            return JSONResponse({"error": str(e)}, status_code=500)
-    
-    #################################################
-    # Context Image Endpoint
-    #################################################
-    @rt("/context-image", methods=["GET"])
-    async def get_context_image(request):
-        """Serve a context image from the PDF documents"""
-        try:
-            # Get the image path from query parameters
-            image_path = request.query_params.get("path", "")
-            
-            if not image_path or not os.path.exists(image_path):
-                return JSONResponse({"error": "Context image not found"}, status_code=404)
-            
-            # Get the image content type
-            content_type = "image/png"  # Default to PNG
-            if image_path.lower().endswith(".jpg") or image_path.lower().endswith(".jpeg"):
-                content_type = "image/jpeg"
-            
-            # Read the image file
-            with open(image_path, "rb") as f:
-                content = f.read()
-            
-            # Return the image
-            return Response(content=content, media_type=content_type)
-            
-        except Exception as e:
-            print(f"Error serving context image: {e}")
-            return JSONResponse({"error": str(e)}, status_code=500)
-    
+    # Return the FastHTML app
     return fasthtml_app
 
 # When running locally
