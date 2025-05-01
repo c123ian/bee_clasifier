@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxx"
+CLAUDE_API_KEY="xxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -68,7 +68,7 @@ image = (
     .pip_install(
         "requests",
         "python-fasthtml==0.12.0",
-        "numpy==2.2.4",  # Specify a compatible version that won't have the _core issue
+        "numpy==2.2.4",  
         "pandas",
         "Pillow",
         "matplotlib",
