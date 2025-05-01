@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -68,7 +68,7 @@ image = (
     .pip_install(
         "requests",
         "python-fasthtml==0.12.0",
-        "numpy==1.23.5",  # Specify a compatible version that won't have the _core issue
+        "numpy==2.2.4",  # Specify a compatible version that won't have the _core issue
         "pandas",
         "Pillow",
         "matplotlib",
@@ -3588,9 +3588,10 @@ def serve():
     #################################################
     # Homepage Route - Unified Classifier Dashboard
     #################################################
+
     @rt("/")
     def homepage():
-        """Render the unified classifier dashboard"""
+        """Render the unified classifier dashboard with enhanced carousel and RAG display"""
         
         # Create toggle switches for classification options
         def create_toggle(name, label, checked=False, description=None):
@@ -3697,10 +3698,10 @@ def serve():
                 id="classify-button",
                 disabled="disabled"
             ),
-            cls="w-full md:w-1/2 bg-base-100 p-6 rounded-lg shadow-lg custom-border border"
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-lg custom-border border mb-6"  # Added mb-6 for spacing
         )
         
-        # Results panel
+        # Results panel with DaisyUI carousel below upload section
         results_panel = Div(
             H2("Classification Results", cls="text-xl font-bold mb-4 text-bee-green"),
             Div(
@@ -3726,14 +3727,28 @@ def serve():
                     cls="hidden"
                 ),
                 
-                # Batch results carousel container
+                # Batch results carousel container - using DaisyUI carousel instead
                 Div(
-                    id="batch-results",
-                    cls="hidden"
+                    # This will be filled dynamically with JavaScript
+                    cls="carousel w-full rounded-lg overflow-hidden hidden",
+                    id="batch-results"
                 ),
                 
                 id="results-content",
                 cls="hidden"
+            ),
+            
+            # RAG Context Display Section (new)
+            Div(
+                H3("Classification Context", cls="text-lg font-semibold mb-2 text-bee-green"),
+                P("Reference materials used to enhance classification accuracy.", cls="mb-2 text-sm text-base-content/70"),
+                Div(
+                    # Context content will be populated here
+                    cls="bg-base-200 p-4 rounded-lg",
+                    id="rag-context-display"
+                ),
+                cls="mt-6 hidden",
+                id="rag-context-section"
             ),
             
             # Actions for results
@@ -3751,7 +3766,7 @@ def serve():
                 cls="mt-6 flex justify-end items-center gap-2 hidden",
                 id="result-actions"
             ),
-            cls="w-full md:w-1/2 bg-base-100 p-6 rounded-lg shadow-lg custom-border border"
+            cls="w-full bg-base-100 p-6 rounded-lg shadow-lg custom-border border"
         )
         
         # Navigation bar
@@ -3776,7 +3791,7 @@ def serve():
             cls="w-full"
         )
         
-        # Add script for form handling with fixes
+        # Add updated script for form handling with carousel and RAG display enhancements
         form_script = Script("""
         document.addEventListener('DOMContentLoaded', function() {
             // Form elements - cache all DOM elements we'll need to reference
@@ -3796,6 +3811,10 @@ def serve():
             const resultActions = document.getElementById('result-actions');
             const copyButton = document.getElementById('copy-button');
             const newButton = document.getElementById('new-button');
+            
+            // RAG Context elements
+            const ragContextSection = document.getElementById('rag-context-section');
+            const ragContextDisplay = document.getElementById('rag-context-display');
             
             // Mode tracking variables
             let isBatchMode = false;
@@ -3960,7 +3979,7 @@ def serve():
                         
                         // Create remove button
                         const removeBtn = document.createElement('div');
-                            removeBtn.className = 'remove-btn';
+                        removeBtn.className = 'remove-btn';
                         removeBtn.innerHTML = '×';
                         removeBtn.onclick = function() {
                             // Remove this file
@@ -4024,6 +4043,7 @@ def serve():
                     resultsPlaceholder.classList.add('hidden');
                     resultsContent.classList.add('hidden');
                     resultActions.classList.add('hidden');
+                    ragContextSection.classList.add('hidden'); // Hide RAG context section
                     classifyButton.disabled = true;
                     classifyButton.classList.add('opacity-50');
                     
@@ -4083,6 +4103,9 @@ def serve():
                     
                     // Display the result using the enhanced display function
                     displaySingleResult(data);
+                    
+                    // Display RAG context if available
+                    displayRagContext(data);
                     
                     // Show containers
                     singleResult.classList.remove('hidden');
@@ -4156,8 +4179,11 @@ def serve():
                     // Save raw response for copy button
                     rawResponseText = data.raw_response;
                     
-                    // Display batch results using the enhanced display function
-                    displayBatchResults(data);
+                    // Display batch results using the enhanced carousel display function
+                    displayBatchCarousel(data);
+                    
+                    // Display RAG context if available
+                    displayRagContext(data);
                     
                     // Show result sections
                     singleResult.classList.add('hidden');
@@ -4204,9 +4230,91 @@ def serve():
                     resultsPlaceholder.classList.remove('hidden');
                     resultsContent.classList.add('hidden');
                     resultActions.classList.add('hidden');
+                    ragContextSection.classList.add('hidden'); // Hide RAG context
                     singleResult.classList.add('hidden');
                     batchResults.classList.add('hidden');
                 });
+            }
+            
+            // Display RAG context section
+            function displayRagContext(result) {
+                // Check if we have context data to display
+                if (result.context_source || 
+                    (result.context_paragraphs && result.context_paragraphs.length > 0) ||
+                    (result.top_sources && result.top_sources.length > 0)) {
+                    
+                    let contextHTML = '';
+                    
+                    // Add the source information
+                    if (result.context_source) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <span class="font-semibold">Source Document:</span>
+                                <span>${result.context_source}</span>
+                            </div>
+                        `;
+                    }
+                    
+                    // Add context paragraphs
+                    if (result.context_paragraphs && result.context_paragraphs.length > 0) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <div class="font-semibold mb-2">Reference Text:</div>
+                                <div class="text-sm bg-base-300 p-3 rounded-md max-h-40 overflow-y-auto">
+                                    ${result.context_paragraphs[0]}
+                                </div>
+                            </div>
+                        `;
+                        
+                        // If there are more paragraphs, add a collapsible section
+                        if (result.context_paragraphs.length > 1) {
+                            contextHTML += `
+                                <details class="collapse mb-3">
+                                    <summary class="collapse-title font-medium">Additional Reference Texts</summary>
+                                    <div class="collapse-content">
+                            `;
+                            
+                            for (let i = 1; i < result.context_paragraphs.length; i++) {
+                                contextHTML += `
+                                    <div class="mb-2 text-sm bg-base-300 p-3 rounded-md">
+                                        ${result.context_paragraphs[i]}
+                                    </div>
+                                `;
+                            }
+                            
+                            contextHTML += `
+                                    </div>
+                                </details>
+                            `;
+                        }
+                    }
+                    
+                    // Add top sources if available
+                    if (result.top_sources && result.top_sources.length > 0) {
+                        contextHTML += `
+                            <div class="mb-3">
+                                <div class="font-semibold mb-2">Top Reference Sources:</div>
+                                <ul class="list-disc pl-5">
+                        `;
+                        
+                        result.top_sources.forEach(source => {
+                            contextHTML += `
+                                <li>${source.filename || 'Unknown'}, page ${source.page || '?'}</li>
+                            `;
+                        });
+                        
+                        contextHTML += `
+                                </ul>
+                            </div>
+                        `;
+                    }
+                    
+                    // If we have any context to display, show the section
+                    if (contextHTML) {
+                        ragContextDisplay.innerHTML = contextHTML;
+                        ragContextSection.classList.remove('hidden');
+                    }
+                }
             }
             
             // Function to display single classification result with context
@@ -4247,37 +4355,6 @@ def serve():
                 
                 resultHTML += `</div>`;
                 
-                // Add context section if available
-                if (result.context_source || (result.context_paragraphs && result.context_paragraphs.length > 0)) {
-                    resultHTML += `
-                        <div class="collapse collapse-arrow bg-base-200 rounded-lg mb-4">
-                            <input type="checkbox" />
-                            <div class="collapse-title font-medium">
-                                Context Information
-                            </div>
-                            <div class="collapse-content">
-                                <div class="mb-3">
-                                    <span class="font-semibold">Source:</span>
-                                    <span id="context-source">${result.context_source || 'No context source available'}</span>
-                                </div>
-                    `;
-                    
-                    // Add context paragraphs if available
-                    if (result.context_paragraphs && result.context_paragraphs.length > 0) {
-                        resultHTML += `
-                            <div class="mb-3">
-                                <div class="font-semibold mb-2">Reference Text:</div>
-                                <div class="text-sm bg-base-300 p-3 rounded-md">${result.context_paragraphs[0]}</div>
-                            </div>
-                        `;
-                    }
-                    
-                    resultHTML += `
-                            </div>
-                        </div>
-                    `;
-                }
-                
                 // Add feedback controls
                 resultHTML += `
                     <div class="flex items-center mt-4 mb-4">
@@ -4309,23 +4386,15 @@ def serve():
                 rawResponseText = result.raw_response;
             }
             
-            // Function to display batch results with context
-            function displayBatchResults(batchResult) {
-                console.log("Displaying batch results for", batchResult.results.length, "images");
+            // Function to display batch results as a DaisyUI carousel
+            function displayBatchCarousel(batchResult) {
+                console.log("Displaying batch carousel for", batchResult.results.length, "images");
                 const batchResultsContainer = document.getElementById('batch-results');
                 
-                // Create results header
-                let batchHTML = `
-                    <h3 class="text-lg font-semibold mb-4 text-center">Batch Results (${batchResult.results.length} images)</h3>
-                `;
+                // Clear the container
+                batchResultsContainer.innerHTML = '';
                 
-                // Create carousel
-                batchHTML += `
-                    <div class="carousel">
-                        <div class="carousel-inner" id="carousel-items">
-                `;
-                
-                // Add each result as a carousel item
+                // Create carousel slides
                 batchResult.results.forEach((result, index) => {
                     // Determine confidence class
                     let confidenceClass = 'badge-warning';
@@ -4335,32 +4404,40 @@ def serve():
                         confidenceClass = 'badge-error';
                     }
                     
-                    batchHTML += `
-                        <div class="carousel-item" id="slide-${index}">
-                            <div class="p-4 bg-base-200 rounded-lg max-w-3xl mx-auto">
-                                <div class="flex justify-between items-center mb-2">
+                    // Create a unique ID for the slide
+                    const slideId = `slide-${index + 1}`;
+                    
+                    // Create the carousel item - using DaisyUI carousel
+                    const carouselItem = document.createElement('div');
+                    carouselItem.id = slideId;
+                    carouselItem.className = 'carousel-item relative w-full';
+                    
+                    // Create the content for this slide
+                    carouselItem.innerHTML = `
+                        <div class="w-full px-4 py-6 bg-base-200 rounded-lg flex flex-col items-center">
+                            <div class="w-full max-w-3xl mx-auto">
+                                <div class="flex justify-between items-center mb-4">
                                     <h3 class="text-lg font-medium">Result ${index + 1} of ${batchResult.results.length}</h3>
                                     <span class="badge ${confidenceClass}">Confidence: ${result.confidence}</span>
                                 </div>
-                                <h4 class="text-lg font-bold mb-2">${result.category}</h4>
+                                
+                                <h4 class="text-xl font-bold mb-2">${result.category}</h4>
                                 <p class="mb-4">${result.description}</p>
-                    `;
-                    
-                    // Add additional details
-                    const details = result.details;
-                    for (const key in details) {
-                        if (key !== 'Main Category' && key !== 'Confidence' && key !== 'Description') {
-                            batchHTML += `
-                                <div class="mb-2">
-                                    <span class="font-semibold">${key}:</span>
-                                    <span>${details[key]}</span>
+                                
+                                <!-- Additional details if available -->
+                                <div class="mb-4">
+                                    ${Object.entries(result.details || {})
+                                        .filter(([key]) => !['Main Category', 'Confidence', 'Description'].includes(key))
+                                        .map(([key, value]) => `
+                                            <div class="mb-2">
+                                                <span class="font-semibold">${key}:</span>
+                                                <span>${value}</span>
+                                            </div>
+                                        `).join('')
+                                    }
                                 </div>
-                            `;
-                        }
-                    }
-                    
-                    // Add feedback controls
-                    batchHTML += `
+                                
+                                <!-- Feedback buttons -->
                                 <div class="flex items-center mt-4">
                                     <span class="text-sm mr-2">Rate this classification:</span>
                                     <button class="btn btn-outline btn-sm mr-2" id="thumbs-up-button-${index}" onclick="provideFeedback('${result.id}', 'positive', 'thumbs-up-button-${index}', 'thumbs-down-button-${index}', 'feedback-message-${index}')">
@@ -4373,123 +4450,37 @@ def serve():
                                 </div>
                             </div>
                         </div>
+                        
+                        <!-- Carousel navigation buttons -->
+                        <div class="absolute left-5 right-5 top-1/2 flex -translate-y-1/2 transform justify-between">
+                            <a href="#slide-${index === 0 ? batchResult.results.length : index}" class="btn btn-circle">❮</a>
+                            <a href="#slide-${index === batchResult.results.length - 1 ? 1 : index + 2}" class="btn btn-circle">❯</a>
+                        </div>
                     `;
+                    
+                    // Add this slide to the carousel
+                    batchResultsContainer.appendChild(carouselItem);
                 });
                 
-                // Close carousel container
-                batchHTML += `
-                        </div>
-                `;
+                // Add carousel indicators at the bottom
+                const indicatorsContainer = document.createElement('div');
+                indicatorsContainer.className = 'flex justify-center w-full py-2 gap-2 mt-4';
                 
-                // Add navigation if more than one result
-                if (batchResult.results.length > 1) {
-                    batchHTML += `
-                        <button class="btn btn-circle carousel-control carousel-control-prev" id="prev-btn">❮</button>
-                        <button class="btn btn-circle carousel-control carousel-control-next" id="next-btn">❯</button>
-                        <div class="carousel-indicators" id="carousel-indicators">
-                    `;
-                    
-                    // Add indicators for navigation
-                    for (let i = 0; i < batchResult.results.length; i++) {
-                        batchHTML += `
-                            <div class="carousel-indicator ${i === 0 ? 'active' : ''}" data-index="${i}"></div>
-                        `;
-                    }
-                    
-                    batchHTML += `</div>`;
-                }
+                batchResult.results.forEach((_, index) => {
+                    const btnIndicator = document.createElement('a');
+                    btnIndicator.href = `#slide-${index + 1}`;
+                    btnIndicator.className = 'btn btn-xs';
+                    btnIndicator.textContent = (index + 1).toString();
+                    indicatorsContainer.appendChild(btnIndicator);
+                });
                 
-                // Add context section if available
-                if (batchResult.context_source || (batchResult.context_paragraphs && batchResult.context_paragraphs.length > 0)) {
-                    batchHTML += `
-                        <div class="collapse collapse-arrow bg-base-200 rounded-lg mt-4 mb-4">
-                            <input type="checkbox" />
-                            <div class="collapse-title font-medium">
-                                Shared Context Information
-                            </div>
-                            <div class="collapse-content">
-                                <div class="mb-3">
-                                    <span class="font-semibold">Source:</span>
-                                    <span>${batchResult.context_source || 'No context source available'}</span>
-                                </div>
-                    `;
-                    
-                    // Add context paragraphs if available
-                    if (batchResult.context_paragraphs && batchResult.context_paragraphs.length > 0) {
-                        batchHTML += `
-                            <div class="mb-3">
-                                <div class="font-semibold mb-2">Reference Text:</div>
-                                <div class="text-sm bg-base-300 p-3 rounded-md">${batchResult.context_paragraphs[0]}</div>
-                            </div>
-                        `;
-                    }
-                    
-                    batchHTML += `
-                            </div>
-                        </div>
-                    `;
-                }
+                batchResultsContainer.appendChild(indicatorsContainer);
                 
-                // Add raw response in collapsible section
-                batchHTML += `
-                    <details class="collapse bg-base-200 mt-4">
-                        <summary class="collapse-title font-medium">Raw Response</summary>
-                        <div class="collapse-content">
-                            <pre class="text-xs whitespace-pre-wrap">${batchResult.raw_response}</pre>
-                        </div>
-                    </details>
-                `;
-                
-                // Set HTML
-                batchResultsContainer.innerHTML = batchHTML;
+                // Show the carousel
+                batchResultsContainer.classList.remove('hidden');
                 
                 // Save raw response for copy button
                 rawResponseText = batchResult.raw_response;
-                
-                // Setup carousel navigation if needed
-                if (batchResult.results.length > 1) {
-                    console.log("Setting up carousel for", batchResult.results.length, "items");
-                    const carouselItems = document.getElementById('carousel-items');
-                    const prevBtn = document.getElementById('prev-btn');
-                    const nextBtn = document.getElementById('next-btn');
-                    const indicators = document.querySelectorAll('.carousel-indicator');
-                    
-                    let currentIndex = 0;
-                    
-                    // Show a specific slide
-                    function showSlide(index) {
-                        // Handle wrapping
-                        if (index < 0) index = batchResult.results.length - 1;
-                        if (index >= batchResult.results.length) index = 0;
-                        
-                        currentIndex = index;
-                        console.log("Showing slide", index);
-                        
-                        // Update transform
-                        carouselItems.style.transform = `translateX(-${index * 100}%)`;
-                        
-                        // Update indicators
-                        indicators.forEach((dot, i) => {
-                            if (i === index) {
-                                dot.classList.add('active');
-                            } else {
-                                dot.classList.remove('active');
-                            }
-                        });
-                    }
-                    
-                    // Add event listeners
-                    if (prevBtn) prevBtn.addEventListener('click', () => showSlide(currentIndex - 1));
-                    if (nextBtn) nextBtn.addEventListener('click', () => showSlide(currentIndex + 1));
-                    
-                    // Add indicator click handlers
-                    indicators.forEach((indicator, i) => {
-                        indicator.addEventListener('click', () => showSlide(i));
-                    });
-                    
-                    // Initialize first slide
-                    showSlide(0);
-                }
             }
             
             // Global function for providing feedback
@@ -4562,8 +4553,76 @@ def serve():
         });
         """)
         
+        # Add enhanced styles for the carousel and RAG context display
+        enhanced_styles = Style("""
+        /* DaisyUI carousel improvements */
+        .carousel {
+            background: var(--color-base-200);
+            border-radius: 0.5rem;
+        }
+        
+        .carousel-item {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        /* Batch previews styling */
+        .batch-previews {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 15px 0;
+        }
+        
+        .preview-item {
+            position: relative;
+            width: 80px;
+            height: 80px;
+        }
+        
+        .preview-img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 0.5rem;
+            border: 2px solid var(--color-base-300);
+        }
+        
+        .remove-btn {
+            position: absolute;
+            top: -8px;
+            right: -8px;
+            background: var(--color-error);
+            color: white;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        
+        /* RAG context styling */
+        #rag-context-display {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        
+        /* Responsive layout */
+        @media (min-width: 768px) {
+            #results-content, #rag-context-section {
+                max-height: none;
+                overflow-y: visible;
+            }
+        }
+        """)
+        
         return Title("Insect Classifier"), Main(
             form_script,
+            enhanced_styles,
             Div(
                 H1("Insect Classification App", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
                 P("Powered by Claude's Vision AI with RAG", cls="text-center mb-8 text-base-content/70"),
@@ -4571,13 +4630,14 @@ def serve():
                 Div(
                     control_panel,
                     results_panel,
-                    cls="flex flex-col md:flex-row gap-6 w-full"
+                    cls="flex flex-col w-full"  # Changed to vertical layout
                 ),
                 cls="container mx-auto px-4 py-8 max-w-6xl"
             ),
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
+                         
     # Return the FastHTML app
     return fasthtml_app
 
