@@ -2431,6 +2431,22 @@ def serve():
             ),
             cls="mb-8"
         )
+
+        # Map Section - Add this after the charts_section and before confidence_feedback_section
+        map_section = Div(
+            H2("Conservation Project Map", cls="text-xl font-bold mb-4 text-bee-green"),
+            Div(
+                Div(
+                    P("View our conservation area at Bionua Project, Dunsany Nature Reserve:", 
+                    cls="text-base mb-2"),
+                    # Map iframe with responsive styling
+                    NotStr('<iframe src="https://restor.eco/embed/sites/ce616eed-268b-43a7-87cc-181c801709fa/" title="Bionua Project at Dunsany Nature Reserve" width="100%" height="500" style="border: none; border-radius: 0.5rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);" frameborder="0"></iframe>'),
+                    cls="w-full bg-base-100 p-6 rounded-lg shadow-md border custom-border"
+                ),
+                cls="w-full mb-8"
+            ),
+            cls="mb-8"
+        )
         
         # Confidence & Feedback Section
         confidence_feedback_section = Div(
@@ -3087,6 +3103,7 @@ def serve():
                 navbar,
                 summary_cards,
                 charts_section,
+                map_section,  # Add the map section here
                 confidence_feedback_section,
                 tables_section,
                 rag_section,
@@ -3095,7 +3112,6 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-
 #################################################
     # API route for chart data
     #################################################
