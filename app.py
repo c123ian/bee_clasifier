@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY="xxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -372,11 +372,20 @@ def load_rag_data():
     BM25_INDEX_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
     TOKENIZED_PARAGRAPHS_PATH = os.path.join(DATA_DIR, "tokenized_paragraphs.pkl")
     
+    # Check if the data directory exists
+    if not os.path.exists(DATA_DIR):
+        logging.error(f"Data directory does not exist: {DATA_DIR}")
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            logging.info(f"Created data directory: {DATA_DIR}")
+        except Exception as e:
+            logging.error(f"Failed to create data directory: {e}")
+    
     # Load data frame with metadata
     if os.path.exists(DATA_PICKLE_PATH):
         try:
             df = pd.read_pickle(DATA_PICKLE_PATH)
-            logging.info(f"Loaded DataFrame with {len(df)} documents")
+            logging.info(f"✅ Loaded DataFrame with {len(df)} documents")
         except Exception as e:
             logging.error(f"Error loading DataFrame: {e}")
             df = pd.DataFrame(columns=["filename", "page", "paragraph_size", "text", "image_key", "full_path"])
@@ -389,22 +398,77 @@ def load_rag_data():
         try:
             with open(PDF_PAGE_IMAGES_PATH, "rb") as f:
                 page_images = pickle.load(f)
-            logging.info(f"Loaded {len(page_images)} image paths")
+            logging.info(f"✅ Loaded {len(page_images)} image paths")
+            
+            # Verify a few paths to make sure they're valid
+            image_keys = list(page_images.keys())
+            if image_keys:
+                sample_keys = image_keys[:3]
+                for key in sample_keys:
+                    path = page_images[key]
+                    if os.path.exists(path):
+                        logging.info(f"✅ Verified image path exists: {path}")
+                    else:
+                        logging.warning(f"⚠️ Image path does not exist: {path}")
         except Exception as e:
             logging.error(f"Error loading image paths: {e}")
             page_images = {}
     else:
         logging.error(f"Image paths file not found at {PDF_PAGE_IMAGES_PATH}")
         page_images = {}
+        
+        # Try to find image paths in PDF_IMAGES_DIR
+        if os.path.exists(PDF_IMAGES_DIR) and os.path.isdir(PDF_IMAGES_DIR):
+            logging.info(f"Searching for PDF images in {PDF_IMAGES_DIR}")
+            try:
+                # Look for subdirectories
+                subdirs = [d for d in os.listdir(PDF_IMAGES_DIR) 
+                           if os.path.isdir(os.path.join(PDF_IMAGES_DIR, d))]
+                logging.info(f"Found {len(subdirs)} subdirectories in PDF_IMAGES_DIR")
+                
+                # Check if there are any PNG files in the subdirectories
+                for subdir in subdirs:
+                    subdir_path = os.path.join(PDF_IMAGES_DIR, subdir)
+                    files = [f for f in os.listdir(subdir_path) if f.endswith('.png')]
+                    if files:
+                        logging.info(f"Found {len(files)} PNG files in {subdir_path}")
+                        
+                        # Add these files to page_images
+                        for filename in files:
+                            try:
+                                page_num = int(os.path.splitext(filename)[0])
+                                image_key = f"{subdir}_{page_num}"
+                                image_path = os.path.join(subdir_path, filename)
+                                page_images[image_key] = image_path
+                            except ValueError:
+                                # If filename is not a number, use the whole filename
+                                image_key = f"{subdir}_{filename}"
+                                image_path = os.path.join(subdir_path, filename)
+                                page_images[image_key] = image_path
+                
+                if page_images:
+                    logging.info(f"✅ Created {len(page_images)} image paths from PDF_IMAGES_DIR")
+            except Exception as e:
+                logging.error(f"Error scanning PDF_IMAGES_DIR: {e}")
     
     # Load ColPali embeddings
     if os.path.exists(COLPALI_EMBEDDINGS_PATH):
         try:
             with open(COLPALI_EMBEDDINGS_PATH, "rb") as f:
                 colpali_embeddings = pickle.load(f)
-            logging.info(f"Loaded {len(colpali_embeddings)} ColPali embeddings")
+            
+            if colpali_embeddings is not None:
+                if isinstance(colpali_embeddings, list):
+                    logging.info(f"✅ Loaded {len(colpali_embeddings)} ColPali embeddings")
+                else:
+                    logging.error(f"⚠️ ColPali embeddings file exists but has unexpected format: {type(colpali_embeddings)}")
+                    colpali_embeddings = None
+            else:
+                logging.error("⚠️ ColPali embeddings file exists but is None")
         except Exception as e:
             logging.error(f"Error loading ColPali embeddings: {e}")
+            import traceback
+            traceback.print_exc()
             colpali_embeddings = None
     else:
         logging.error(f"ColPali embeddings not found at {COLPALI_EMBEDDINGS_PATH}")
@@ -417,9 +481,49 @@ def load_rag_data():
                 bm25_index = pickle.load(f)
             with open(TOKENIZED_PARAGRAPHS_PATH, "rb") as f:
                 tokenized_docs = pickle.load(f)
-            logging.info("Loaded BM25 index successfully")
+            logging.info("✅ Loaded BM25 index successfully")
         else:
-            logging.warning("BM25 index not found, will create if needed")
+            logging.warning("⚠️ BM25 index not found, will create if needed")
+            
+            # Try to create BM25 index if we have the dataframe
+            if df is not None and len(df) > 0 and 'text' in df.columns:
+                try:
+                    from rank_bm25 import BM25Okapi
+                    import nltk
+                    from nltk.tokenize import word_tokenize
+                    
+                    # Ensure nltk data is downloaded
+                    try:
+                        nltk.data.find('tokenizers/punkt')
+                    except LookupError:
+                        nltk.download('punkt')
+                    
+                    # Tokenize all documents
+                    tokenized_docs = []
+                    for _, row in df.iterrows():
+                        if row['text']:
+                            tokenized_docs.append(word_tokenize(row['text'].lower()))
+                        else:
+                            tokenized_docs.append([])
+                    
+                    # Create BM25 index
+                    bm25_index = BM25Okapi(tokenized_docs)
+                    
+                    # Save the index and tokenized documents for future use
+                    os.makedirs(os.path.dirname(BM25_INDEX_PATH), exist_ok=True)
+                    with open(BM25_INDEX_PATH, "wb") as f:
+                        pickle.dump(bm25_index, f)
+                    with open(TOKENIZED_PARAGRAPHS_PATH, "wb") as f:
+                        pickle.dump(tokenized_docs, f)
+                        
+                    logging.info("✅ Created and saved BM25 index")
+                except Exception as e:
+                    logging.error(f"Error creating BM25 index: {e}")
+                    bm25_index = None
+                    tokenized_docs = None
+            else:
+                bm25_index = None
+                tokenized_docs = None
     except Exception as e:
         logging.error(f"Error loading BM25 index: {e}")
         bm25_index = None
@@ -430,6 +534,32 @@ def load_rag_data():
     os.makedirs(HEATMAP_DIR, exist_ok=True)
     os.makedirs(PDF_IMAGES_DIR, exist_ok=True)
     os.makedirs(TEMPLATES_DIR, exist_ok=True)
+    
+    # Verify embeddings type compatibility
+    if colpali_embeddings is not None:
+        try:
+            if isinstance(colpali_embeddings, list) and len(colpali_embeddings) > 0:
+                sample_embedding = colpali_embeddings[0]
+                logging.info(f"Embeddings type: {type(sample_embedding)}")
+                
+                if not isinstance(sample_embedding, (np.ndarray, torch.Tensor)):
+                    logging.warning(f"⚠️ Embeddings are not numpy arrays or torch tensors: {type(sample_embedding)}")
+        except Exception as e:
+            logging.error(f"Error checking embeddings type: {e}")
+    
+    # Summary of loaded components
+    logging.info("=== RAG Data Loading Summary ===")
+    logging.info(f"DataFrame: {'✅ Loaded' if df is not None and len(df) > 0 else '❌ Not available'}")
+    logging.info(f"Page Images: {'✅ Loaded' if page_images and len(page_images) > 0 else '❌ Not available'}")
+    logging.info(f"ColPali Embeddings: {'✅ Loaded' if colpali_embeddings is not None else '❌ Not available'}")
+    logging.info(f"BM25 Index: {'✅ Loaded' if bm25_index is not None else '❌ Not available'}")
+    
+    # Check if all necessary components are available
+    if colpali_embeddings is None or df is None or len(df) == 0:
+        logging.warning("⚠️ RAG system is not fully initialized. Some features may be limited.")
+        logging.warning("⚠️ Please run embedding.py to generate embeddings from PDF documents.")
+    else:
+        logging.info("✅ RAG system is fully initialized and ready to use.")
 
 # Retrieve relevant documents for RAG
 async def retrieve_relevant_documents(query, top_k=5):
@@ -602,20 +732,202 @@ async def retrieve_relevant_documents(query, top_k=5):
         return [], []
 
 # synchronous wrapper for the async retrieve_relevant_documents
-def retrieve_relevant_documents_sync(query, top_k=5):
-    """Synchronous version of retrieve_relevant_documents for use in non-async functions"""
-    import asyncio
+async def retrieve_relevant_documents(query, top_k=5):
+    """Retrieve most relevant documents using embeddings and BM25"""
+    global colpali_embeddings, df, bm25_index, tokenized_docs
     
-    # Create a new event loop
-    loop = asyncio.new_event_loop()
+    if colpali_embeddings is None or df is None or len(df) == 0:
+        logging.error("No documents or embeddings available for retrieval")
+        return [], []
+        
+    retrieved_paragraphs = []
+    top_sources_data = []
     
+    # First try using sentence-transformers for vector search
     try:
-        # Run the async function in the event loop and get the result
-        result = loop.run_until_complete(retrieve_relevant_documents(query, top_k))
-        return result
-    finally:
-        # Clean up the event loop
-        loop.close()
+        from sentence_transformers import SentenceTransformer, util
+        
+        # Initialize sentence-transformer model if needed for vector search
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        query_embedding = model.encode(query, convert_to_tensor=True)
+        
+        # Convert colpali embeddings to tensors for similarity comparison
+        # Assuming colpali_embeddings is a list of numpy arrays
+        document_embeddings = []
+        for emb in colpali_embeddings:
+            if isinstance(emb, np.ndarray):
+                document_embeddings.append(torch.tensor(emb))
+            elif isinstance(emb, torch.Tensor):
+                document_embeddings.append(emb)
+            else:
+                logging.warning(f"Unexpected embedding type: {type(emb)}, trying to convert to tensor")
+                try:
+                    document_embeddings.append(torch.tensor(np.array(emb)))
+                except:
+                    logging.error(f"Could not convert embedding to tensor")
+                    continue
+        
+        # Calculate similarities
+        similarities = []
+        for idx, doc_emb in enumerate(document_embeddings):
+            try:
+                # Ensure embeddings have same dimensions
+                if len(doc_emb.shape) > 1 and doc_emb.shape[0] > 1:
+                    # If document has multiple vectors, take max similarity
+                    # Reshape to match dimensions for comparison
+                    doc_emb_reshaped = doc_emb.reshape(-1, doc_emb.shape[-1])
+                    sim = util.pytorch_cos_sim(query_embedding, doc_emb_reshaped).max().item()
+                else:
+                    # Single vector case
+                    sim = util.pytorch_cos_sim(query_embedding, doc_emb).item()
+                
+                similarities.append((idx, sim))
+            except Exception as e:
+                logging.error(f"Error calculating similarity for document {idx}: {e}")
+                similarities.append((idx, 0.0))
+        
+        # Sort by similarity score
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        vector_top_indices = [idx for idx, _ in similarities[:top_k]]
+        
+        # Try BM25 keyword search if available
+        keyword_top_indices = []
+        bm25_scores = None
+        if bm25_index is not None and tokenized_docs is not None:
+            try:
+                # Tokenize query and get BM25 scores
+                tokenized_query = word_tokenize(query.lower())
+                bm25_scores = bm25_index.get_scores(tokenized_query)
+                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
+            except Exception as e:
+                logging.error(f"Error in BM25 scoring: {e}")
+        
+        # Create BM25 index if it doesn't exist yet
+        elif df is not None and len(df) > 0:
+            try:
+                from rank_bm25 import BM25Okapi
+                logging.info("Building BM25 index from document texts")
+                
+                # Tokenize all documents
+                tokenized_docs = []
+                for _, row in df.iterrows():
+                    tokenized_docs.append(word_tokenize(row['text'].lower()))
+                
+                # Create BM25 index
+                bm25_index = BM25Okapi(tokenized_docs)
+                
+                # Get scores for the current query
+                tokenized_query = word_tokenize(query.lower())
+                bm25_scores = bm25_index.get_scores(tokenized_query)
+                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
+                
+                # Save the index and tokenized documents for future use
+                os.makedirs(DATA_DIR, exist_ok=True)
+                with open(os.path.join(DATA_DIR, "bm25_index.pkl"), "wb") as f:
+                    pickle.dump(bm25_index, f)
+                with open(os.path.join(DATA_DIR, "tokenized_paragraphs.pkl"), "wb") as f:
+                    pickle.dump(tokenized_docs, f)
+                    
+                logging.info("Created and saved BM25 index")
+            except Exception as e:
+                logging.error(f"Error creating BM25 index: {e}")
+        
+        # Combine results (hybrid retrieval)
+        all_indices = list(set(vector_top_indices + keyword_top_indices))
+        logging.info(f"Combined {len(vector_top_indices)} vector and {len(keyword_top_indices)} keyword indices into {len(all_indices)} unique indices")
+        
+        # Get data for reranking
+        docs_for_reranking = []
+        doc_indices = []
+        
+        for idx in all_indices:
+            if idx < len(df):
+                try:
+                    # Get document info
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    text = df.iloc[idx]['text']
+                    
+                    # Get vector score
+                    vector_score = 0.0
+                    for v_idx, score in similarities:
+                        if v_idx == idx:
+                            vector_score = score
+                            break
+                    
+                    # Get keyword score (if available)
+                    keyword_score = 0.0
+                    if bm25_scores is not None and len(bm25_scores) > idx:
+                        keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
+                    
+                    # Combine scores (weighted)
+                    alpha = 0.7  # Weight for vector search
+                    combined_score = alpha * vector_score + (1 - alpha) * keyword_score
+                    
+                    # Store for reranking
+                    docs_for_reranking.append(text)
+                    doc_indices.append(idx)
+                    
+                    # Add to results
+                    retrieved_paragraphs.append(text)
+                    top_sources_data.append({
+                        'filename': filename,
+                        'page': page_num,
+                        'score': combined_score,
+                        'vector_score': vector_score,
+                        'keyword_score': keyword_score,
+                        'image_key': image_key,
+                        'idx': idx
+                    })
+                except Exception as e:
+                    logging.error(f"Error processing document at index {idx}: {e}")
+        
+        # Rerank results if we have documents
+        if docs_for_reranking:
+            try:
+                # Use a cross-encoder reranker
+                from rerankers import Reranker
+                ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
+                ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
+                top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
+                
+                # Get the final top documents after reranking
+                final_retrieved_paragraphs = []
+                final_top_sources = []
+                
+                for ranked_doc in top_ranked:
+                    ranked_idx = docs_for_reranking.index(ranked_doc.text)
+                    doc_idx = doc_indices[ranked_idx]
+                    source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
+                    if source_info:
+                        source_info['reranker_score'] = ranked_doc.score
+                        final_top_sources.append(source_info)
+                        final_retrieved_paragraphs.append(ranked_doc.text)
+                
+                logging.info(f"Retrieved and reranked {len(final_retrieved_paragraphs)} paragraphs")
+                return final_retrieved_paragraphs, final_top_sources
+                
+            except Exception as e:
+                logging.error(f"Error in reranking: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # If reranking fails, sort by combined score
+        sorted_indices = sorted(range(len(top_sources_data)), 
+                               key=lambda i: top_sources_data[i]['score'], 
+                               reverse=True)
+        sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
+        sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
+        
+        logging.info(f"Retrieved {len(sorted_paragraphs)} paragraphs (fallback sorting)")
+        return sorted_paragraphs, sorted_sources
+        
+    except Exception as e:
+        logging.error(f"Error in document retrieval: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return [], []
 
 
 # Format image for API calls
@@ -631,49 +943,127 @@ def format_image(image):
 
 # Get context image from PDF pages
 def get_context_image(top_sources):
-    """Get the context image from retrieved PDF pages"""
+    """Get the context image from retrieved PDF pages with robust path resolution"""
     global page_images
     
     if not top_sources or len(top_sources) == 0:
+        logging.info("No top sources available for context image retrieval")
         return None
         
     # Get the top source document
     top_source = top_sources[0]
     image_key = top_source.get('image_key')
+    filename = top_source.get('filename', '')
+    page_num = top_source.get('page', 0)
     
-    if not image_key or image_key not in page_images:
-        logging.warning(f"Context image not found for key: {image_key}")
-        
-        # Try to find the image by reconstructing path patterns
+    logging.info(f"Looking for context image with key: {image_key}, filename: {filename}, page: {page_num}")
+    
+    # Try the direct path from page_images dictionary first
+    if image_key and image_key in page_images:
+        image_path = page_images[image_key]
+        logging.info(f"Found image key in page_images dictionary: {image_path}")
+        if os.path.exists(image_path):
+            try:
+                context_image = Image.open(image_path)
+                logging.info(f"Successfully loaded context image from: {image_path}")
+                return context_image
+            except Exception as e:
+                logging.error(f"Error opening image {image_path}: {e}")
+    else:
+        logging.warning(f"Image key {image_key} not found in page_images dictionary")
+    
+    # If we couldn't find the image using the key, try different path patterns
+    potential_paths = []
+    
+    # Try pattern 1: Using image_key parts
+    if image_key:
         parts = image_key.split('_')
         if len(parts) >= 2:
-            filename = '_'.join(parts[:-1])
-            page_num = parts[-1]
+            key_filename = '_'.join(parts[:-1])
+            key_page = parts[-1]
             
-            # Check different potential locations
-            potential_paths = [
-                os.path.join(PDF_IMAGES_DIR, filename, f"{page_num}.png"),
-                os.path.join(PDF_IMAGES_DIR, filename, f"page_{page_num}.png"),
-                os.path.join(PDF_IMAGES_DIR, f"{filename}_{page_num}.png")
-            ]
-            
-            for potential_path in potential_paths:
-                if os.path.exists(potential_path):
-                    logging.info(f"Found context image at: {potential_path}")
-                    return Image.open(potential_path)
-            
-        return None
-        
-    try:
-        image_path = page_images[image_key]
-        if os.path.exists(image_path):
-            context_image = Image.open(image_path)
-            return context_image
-        else:
-            logging.error(f"Context image file not found: {image_path}")
-    except Exception as e:
-        logging.error(f"Error loading context image: {e}")
+            potential_paths.extend([
+                os.path.join(PDF_IMAGES_DIR, key_filename, f"{key_page}.png"),
+                os.path.join(PDF_IMAGES_DIR, key_filename, f"page_{key_page}.png"),
+                os.path.join(PDF_IMAGES_DIR, f"{key_filename}_{key_page}.png")
+            ])
     
+    # Try pattern 2: Using filename and page directly
+    if filename:
+        # Remove file extension if present
+        base_filename = os.path.splitext(filename)[0]
+        
+        potential_paths.extend([
+            os.path.join(PDF_IMAGES_DIR, base_filename, f"{page_num}.png"),
+            os.path.join(PDF_IMAGES_DIR, base_filename, f"{page_num-1}.png"),  # Sometimes pages are 0-indexed
+            os.path.join(PDF_IMAGES_DIR, base_filename, f"page_{page_num}.png"),
+            os.path.join(PDF_IMAGES_DIR, f"{base_filename}_{page_num}.png"),
+            os.path.join(PDF_IMAGES_DIR, f"{base_filename}/page_{page_num}.png")
+        ])
+    
+    # Try all potential paths
+    for path in potential_paths:
+        logging.info(f"Trying potential path: {path}")
+        if os.path.exists(path):
+            try:
+                context_image = Image.open(path)
+                logging.info(f"Successfully loaded context image from alternative path: {path}")
+                return context_image
+            except Exception as e:
+                logging.error(f"Error opening image {path}: {e}")
+    
+    # If path wasn't in our list, try listing directory contents to find matching files
+    if filename:
+        base_filename = os.path.splitext(filename)[0]
+        dir_path = os.path.join(PDF_IMAGES_DIR, base_filename)
+        
+        if os.path.exists(dir_path) and os.path.isdir(dir_path):
+            try:
+                files = os.listdir(dir_path)
+                logging.info(f"Found {len(files)} files in {dir_path}: {files[:10]}")
+                
+                # Look for files that might match the page number
+                page_files = [f for f in files if f.startswith(str(page_num)) or f.endswith(f"{page_num}.png")]
+                if page_files:
+                    path = os.path.join(dir_path, page_files[0])
+                    try:
+                        context_image = Image.open(path)
+                        logging.info(f"Found matching page file: {path}")
+                        return context_image
+                    except Exception as e:
+                        logging.error(f"Error opening image {path}: {e}")
+            except Exception as e:
+                logging.error(f"Error listing directory {dir_path}: {e}")
+    
+    # Check the PDF_IMAGES_DIR root for any matching files
+    try:
+        if os.path.exists(PDF_IMAGES_DIR) and os.path.isdir(PDF_IMAGES_DIR):
+            directories = [d for d in os.listdir(PDF_IMAGES_DIR) 
+                          if os.path.isdir(os.path.join(PDF_IMAGES_DIR, d))]
+            logging.info(f"Available directories in {PDF_IMAGES_DIR}: {directories}")
+            
+            # If filename matches or is similar to any directory, check inside
+            if filename:
+                base_filename = os.path.splitext(filename)[0]
+                for dir_name in directories:
+                    if base_filename.lower() in dir_name.lower() or dir_name.lower() in base_filename.lower():
+                        dir_path = os.path.join(PDF_IMAGES_DIR, dir_name)
+                        files = os.listdir(dir_path)
+                        
+                        # Look for the page number
+                        for file in files:
+                            if file.startswith(str(page_num)) or f"_{page_num}." in file or f"_{page_num}_" in file:
+                                path = os.path.join(dir_path, file)
+                                try:
+                                    context_image = Image.open(path)
+                                    logging.info(f"Found matching file in similar directory: {path}")
+                                    return context_image
+                                except Exception as e:
+                                    logging.error(f"Error opening image {path}: {e}")
+    except Exception as e:
+        logging.error(f"Error searching PDF_IMAGES_DIR: {e}")
+    
+    logging.warning(f"Could not find context image for {filename} page {page_num}")
     return None
 
 # Helper function to get context image path
@@ -1035,19 +1425,44 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
     # Get relevant context using RAG retrieval
     context_text = ""
     context_source = None
+    context_image_data = None
     retrieved_paragraphs = []
     top_sources = []
     
-    if options.get("use_rag", True):  # Default to using RAG
-        query = "insect classification"
-        # Use the synchronous wrapper to call the async function
-        retrieved_paragraphs, top_sources = retrieve_relevant_documents_sync(query, top_k=3)
+    # Check if RAG is available and enabled
+    rag_enabled = options.get("use_rag", True)
+    rag_available = colpali_embeddings is not None and df is not None and len(df) > 0
+    
+    if rag_enabled:
+        if rag_available:
+            query = "insect classification"
+            try:
+                # Use the synchronous wrapper to call the async function
+                retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
+                logging.info(f"Retrieved {len(retrieved_paragraphs)} paragraphs and {len(top_sources)} top sources")
 
-        if retrieved_paragraphs:
-            context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
-            if top_sources and len(top_sources) > 0:
-                source = top_sources[0]
-                context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                if retrieved_paragraphs:
+                    context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
+                    if top_sources and len(top_sources) > 0:
+                        source = top_sources[0]
+                        context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                        logging.info(f"Using context source: {context_source}")
+                        
+                        # Get the context image with more robust path resolution
+                        context_image = get_context_image(top_sources)
+                        if context_image:
+                            # Convert context image to base64
+                            logging.info(f"Found context image, converting to base64")
+                            context_image_data = format_image(context_image)
+                        else:
+                            logging.warning(f"Could not find context image for {context_source}")
+            except Exception as e:
+                logging.error(f"Error retrieving context: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue without context if retrieval fails
+        else:
+            logging.warning("RAG requested but data not available. Proceeding without context")
     
     # Prepare the prompt
     categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
@@ -1071,33 +1486,56 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
             "content-type": "application/json"
         }
         
+        # Build content array for the message
+        content = []
+        
+        # Add the input image
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": image_data
+            }
+        })
+        
+        # Add the context image if available
+        if context_image_data:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": context_image_data
+                }
+            })
+        
+        # Add the text prompt
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
         payload = {
             "model": "claude-3-7-sonnet-20250219",
             "max_tokens": 1024,
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_data
-                            }
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt
-                        }
-                    ]
+                    "content": content
                 }
             ]
         }
         
+        # Log what's being sent to the API
+        logging.info(f"Sending request to Claude API with {len(content)} content items")
+        if context_image_data:
+            logging.info("Including context image in request")
+        
         # Make the API call
         response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
         response.raise_for_status()
+        
         # Extract the response content
         result = response.json()
         classification_text = result["content"][0]["text"]
@@ -1142,6 +1580,9 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
                 "context_source": context_source,
                 "context_paragraphs": retrieved_paragraphs,
                 "top_sources": top_sources,
+                "rag_available": rag_available,
+                "rag_enabled": rag_enabled,
+                "context_image_used": context_image_data is not None,
                 "raw_response": classification_text
             }
             
@@ -1157,6 +1598,9 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
                 "context_source": context_source,
                 "context_paragraphs": retrieved_paragraphs,
                 "top_sources": top_sources,
+                "rag_available": rag_available,  
+                "rag_enabled": rag_enabled,
+                "context_image_used": context_image_data is not None,
                 "raw_response": classification_text,
                 "db_error": str(db_error)
             }
@@ -1218,7 +1662,7 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
     if options.get("use_rag", True):  # Default to using RAG
         query = "insect classification"
         # Use the synchronous wrapper to call the async function
-        retrieved_paragraphs, top_sources = retrieve_relevant_documents_sync(query, top_k=3)
+        retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
         
         if retrieved_paragraphs:
             context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
@@ -1387,7 +1831,6 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
 @modal.asgi_app()
 def serve():
     """Main FastHTML Server for Bee Classifier Dashboard with RAG"""
-    from rank_bm25 import BM25Okapi
     # Load RAG data at startup
     load_rag_data()
     
