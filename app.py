@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -361,9 +361,165 @@ def get_classification_stats():
         }
     
 
-# RAG-related functions
+# Add this function to app.py
+def initialize_from_image_directory():
+    """Initialize RAG data directly from existing images in PDF_IMAGES_DIR"""
+    global colpali_embeddings, df, page_images
+    
+    logging.info(f"Initializing RAG data from images in {PDF_IMAGES_DIR}...")
+    
+    # Scan for images
+    all_images = []
+    image_paths = {}
+    metadata_rows = []
+    page_contents = []
+    
+    # Check if PDF_IMAGES_DIR exists
+    if not os.path.exists(PDF_IMAGES_DIR):
+        logging.error(f"Image directory does not exist: {PDF_IMAGES_DIR}")
+        return False
+    
+    # Look for subdirectories, especially FIT-Counts-guide
+    subdirs = [d for d in os.listdir(PDF_IMAGES_DIR) if os.path.isdir(os.path.join(PDF_IMAGES_DIR, d))]
+    
+    if not subdirs:
+        logging.warning(f"No subdirectories found in {PDF_IMAGES_DIR}")
+        # Look for images directly in PDF_IMAGES_DIR
+        image_files = [f for f in os.listdir(PDF_IMAGES_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        if image_files:
+            subdirs = ['']  # Process the root directory
+    
+    for subdir in subdirs:
+        dir_path = os.path.join(PDF_IMAGES_DIR, subdir)
+        if subdir == '':  # Handle case where images are in PDF_IMAGES_DIR directly
+            dir_path = PDF_IMAGES_DIR
+        
+        # Find all image files in this directory
+        image_files = [f for f in os.listdir(dir_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        
+        if not image_files:
+            continue
+            
+        logging.info(f"Found {len(image_files)} images in {dir_path}")
+        
+        # Process each image
+        for filename in image_files:
+            try:
+                # Try to get page number from filename
+                page_num = int(os.path.splitext(filename)[0])
+            except ValueError:
+                # If filename is not a number, use a counter
+                page_num = len(all_images)
+            
+            # Full path to the image
+            image_path = os.path.join(dir_path, filename)
+            
+            # Create image key
+            image_key = f"{subdir}_{page_num}" if subdir else f"doc_{page_num}"
+            
+            try:
+                # Load the image
+                img = Image.open(image_path)
+                all_images.append(img)
+                
+                # Store image path
+                image_paths[image_key] = image_path
+                
+                # Create metadata
+                metadata_rows.append({
+                    "filename": subdir if subdir else "document",
+                    "page": page_num,
+                    "paragraph_size": 0,
+                    "text": f"[Image content from page {page_num} of {subdir if subdir else 'document'}]",
+                    "image_key": image_key,
+                    "full_path": image_path
+                })
+                
+                # Add placeholder text
+                page_contents.append(f"[Image content from page {page_num} of {subdir if subdir else 'document'}]")
+                
+                logging.info(f"Processed image: {image_key} from {image_path}")
+            except Exception as e:
+                logging.error(f"Error processing image {image_path}: {e}")
+    
+    if not all_images:
+        logging.error("No images were found or processed")
+        return False
+    
+    # Create DataFrame
+    df = pd.DataFrame({
+        "filename": [m["filename"] for m in metadata_rows],
+        "page": [m["page"] for m in metadata_rows],
+        "paragraph_size": [m["paragraph_size"] for m in metadata_rows],
+        "text": page_contents,
+        "image_key": [m["image_key"] for m in metadata_rows],
+        "full_path": [m["full_path"] for m in metadata_rows]
+    })
+    
+    # Save DataFrame
+    data_path = os.path.join(DATA_DIR, "data.pkl")
+    df.to_pickle(data_path)
+    logging.info(f"Created and saved DataFrame with {len(df)} entries to {data_path}")
+    
+    # Save image paths
+    images_path = os.path.join(DATA_DIR, "pdf_page_image_paths.pkl")
+    with open(images_path, "wb") as f:
+        pickle.dump(image_paths, f)
+    logging.info(f"Saved {len(image_paths)} image paths to {images_path}")
+    
+    # Generate embeddings
+    try:
+        from colpali_engine.models import ColQwen2, ColQwen2Processor
+        
+        # Load model
+        logging.info("Loading ColQwen2 model for embedding generation...")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = ColQwen2.from_pretrained(
+            "vidore/colqwen2-v1.0",
+            torch_dtype=torch.bfloat16, 
+            device_map=device
+        ).eval()
+        processor = ColQwen2Processor.from_pretrained("vidore/colqwen2-v1.0")
+        
+        # Process images in small batches
+        batch_size = 2  # Keep small to avoid OOM
+        all_embeddings = []
+        
+        for i in range(0, len(all_images), batch_size):
+            batch = all_images[i:i+batch_size]
+            logging.info(f"Processing batch {i//batch_size + 1} of {(len(all_images)-1)//batch_size + 1}")
+            
+            # Process batch
+            processed = processor.process_images(batch).to(model.device)
+            
+            # Generate embeddings
+            with torch.no_grad():
+                batch_embeddings = model(**processed)
+            
+            # Store embeddings
+            for emb in batch_embeddings:
+                all_embeddings.append(emb.detach().cpu().numpy())
+        
+        # Save embeddings
+        embeddings_path = os.path.join(DATA_DIR, "colpali_embeddings.pkl")
+        with open(embeddings_path, "wb") as f:
+            pickle.dump(all_embeddings, f)
+        logging.info(f"Generated and saved {len(all_embeddings)} embeddings to {embeddings_path}")
+        
+        # Update global variable
+        colpali_embeddings = all_embeddings
+        page_images = image_paths
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error generating embeddings: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+# Modify load_rag_data to call initialize_from_image_directory if needed
 def load_rag_data():
-    """Load all data needed for document retrieval"""
+    """Load all data needed for document retrieval with fallback to image directory initialization"""
     global colpali_embeddings, df, page_images, bm25_index, tokenized_docs
     
     # Path definitions for RAG data
@@ -375,12 +531,15 @@ def load_rag_data():
     
     # Check if the data directory exists
     if not os.path.exists(DATA_DIR):
-        logging.error(f"Data directory does not exist: {DATA_DIR}")
+        logging.warning(f"Data directory does not exist: {DATA_DIR}")
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             logging.info(f"Created data directory: {DATA_DIR}")
         except Exception as e:
             logging.error(f"Failed to create data directory: {e}")
+    
+    # Track whether we've loaded all necessary data
+    data_loaded = True
     
     # Load data frame with metadata
     if os.path.exists(DATA_PICKLE_PATH):
@@ -389,10 +548,12 @@ def load_rag_data():
             logging.info(f"✅ Loaded DataFrame with {len(df)} documents")
         except Exception as e:
             logging.error(f"Error loading DataFrame: {e}")
-            df = pd.DataFrame(columns=["filename", "page", "paragraph_size", "text", "image_key", "full_path"])
+            df = None
+            data_loaded = False
     else:
-        logging.error(f"DataFrame not found at {DATA_PICKLE_PATH}")
-        df = pd.DataFrame(columns=["filename", "page", "paragraph_size", "text", "image_key", "full_path"])
+        logging.warning(f"DataFrame not found at {DATA_PICKLE_PATH}")
+        df = None
+        data_loaded = False
     
     # Load image paths
     if os.path.exists(PDF_PAGE_IMAGES_PATH):
@@ -400,57 +561,14 @@ def load_rag_data():
             with open(PDF_PAGE_IMAGES_PATH, "rb") as f:
                 page_images = pickle.load(f)
             logging.info(f"✅ Loaded {len(page_images)} image paths")
-            
-            # Verify a few paths to make sure they're valid
-            image_keys = list(page_images.keys())
-            if image_keys:
-                sample_keys = image_keys[:3]
-                for key in sample_keys:
-                    path = page_images[key]
-                    if os.path.exists(path):
-                        logging.info(f"✅ Verified image path exists: {path}")
-                    else:
-                        logging.warning(f"⚠️ Image path does not exist: {path}")
         except Exception as e:
             logging.error(f"Error loading image paths: {e}")
             page_images = {}
+            data_loaded = False
     else:
-        logging.error(f"Image paths file not found at {PDF_PAGE_IMAGES_PATH}")
+        logging.warning(f"Image paths file not found at {PDF_PAGE_IMAGES_PATH}")
         page_images = {}
-        
-        # Try to find image paths in PDF_IMAGES_DIR
-        if os.path.exists(PDF_IMAGES_DIR) and os.path.isdir(PDF_IMAGES_DIR):
-            logging.info(f"Searching for PDF images in {PDF_IMAGES_DIR}")
-            try:
-                # Look for subdirectories
-                subdirs = [d for d in os.listdir(PDF_IMAGES_DIR) 
-                           if os.path.isdir(os.path.join(PDF_IMAGES_DIR, d))]
-                logging.info(f"Found {len(subdirs)} subdirectories in PDF_IMAGES_DIR")
-                
-                # Check if there are any PNG files in the subdirectories
-                for subdir in subdirs:
-                    subdir_path = os.path.join(PDF_IMAGES_DIR, subdir)
-                    files = [f for f in os.listdir(subdir_path) if f.endswith('.png')]
-                    if files:
-                        logging.info(f"Found {len(files)} PNG files in {subdir_path}")
-                        
-                        # Add these files to page_images
-                        for filename in files:
-                            try:
-                                page_num = int(os.path.splitext(filename)[0])
-                                image_key = f"{subdir}_{page_num}"
-                                image_path = os.path.join(subdir_path, filename)
-                                page_images[image_key] = image_path
-                            except ValueError:
-                                # If filename is not a number, use the whole filename
-                                image_key = f"{subdir}_{filename}"
-                                image_path = os.path.join(subdir_path, filename)
-                                page_images[image_key] = image_path
-                
-                if page_images:
-                    logging.info(f"✅ Created {len(page_images)} image paths from PDF_IMAGES_DIR")
-            except Exception as e:
-                logging.error(f"Error scanning PDF_IMAGES_DIR: {e}")
+        data_loaded = False
     
     # Load ColPali embeddings
     if os.path.exists(COLPALI_EMBEDDINGS_PATH):
@@ -458,109 +576,84 @@ def load_rag_data():
             with open(COLPALI_EMBEDDINGS_PATH, "rb") as f:
                 colpali_embeddings = pickle.load(f)
             
-            if colpali_embeddings is not None:
-                if isinstance(colpali_embeddings, list):
-                    logging.info(f"✅ Loaded {len(colpali_embeddings)} ColPali embeddings")
-                else:
-                    logging.error(f"⚠️ ColPali embeddings file exists but has unexpected format: {type(colpali_embeddings)}")
-                    colpali_embeddings = None
+            if isinstance(colpali_embeddings, list) and len(colpali_embeddings) > 0:
+                logging.info(f"✅ Loaded {len(colpali_embeddings)} ColPali embeddings")
             else:
-                logging.error("⚠️ ColPali embeddings file exists but is None")
+                logging.warning(f"ColPali embeddings file exists but has unexpected format")
+                colpali_embeddings = None
+                data_loaded = False
         except Exception as e:
             logging.error(f"Error loading ColPali embeddings: {e}")
-            import traceback
-            traceback.print_exc()
             colpali_embeddings = None
+            data_loaded = False
     else:
-        logging.error(f"ColPali embeddings not found at {COLPALI_EMBEDDINGS_PATH}")
+        logging.warning(f"ColPali embeddings not found at {COLPALI_EMBEDDINGS_PATH}")
         colpali_embeddings = None
+        data_loaded = False
     
-    # Load BM25 index
-    try:
-        if os.path.exists(BM25_INDEX_PATH) and os.path.exists(TOKENIZED_PARAGRAPHS_PATH):
-            with open(BM25_INDEX_PATH, "rb") as f:
-                bm25_index = pickle.load(f)
-            with open(TOKENIZED_PARAGRAPHS_PATH, "rb") as f:
-                tokenized_docs = pickle.load(f)
-            logging.info("✅ Loaded BM25 index successfully")
+    # Initialize from image directory if data is missing
+    if not data_loaded or colpali_embeddings is None or df is None or not page_images:
+        logging.info("Some RAG data is missing. Initializing from image directory...")
+        if initialize_from_image_directory():
+            logging.info("✅ Successfully initialized RAG data from image directory")
         else:
-            logging.warning("⚠️ BM25 index not found, will create if needed")
-            
-            # Try to create BM25 index if we have the dataframe
-            if df is not None and len(df) > 0 and 'text' in df.columns:
-                try:
-                    from rank_bm25 import BM25Okapi
-                    import nltk
-                    from nltk.tokenize import word_tokenize
-                    
-                    # Ensure nltk data is downloaded
-                    try:
-                        nltk.data.find('tokenizers/punkt')
-                    except LookupError:
-                        nltk.download('punkt')
-                    
-                    # Tokenize all documents
-                    tokenized_docs = []
-                    for _, row in df.iterrows():
-                        if row['text']:
-                            tokenized_docs.append(word_tokenize(row['text'].lower()))
-                        else:
-                            tokenized_docs.append([])
-                    
-                    # Create BM25 index
-                    bm25_index = BM25Okapi(tokenized_docs)
-                    
-                    # Save the index and tokenized documents for future use
-                    os.makedirs(os.path.dirname(BM25_INDEX_PATH), exist_ok=True)
-                    with open(BM25_INDEX_PATH, "wb") as f:
-                        pickle.dump(bm25_index, f)
-                    with open(TOKENIZED_PARAGRAPHS_PATH, "wb") as f:
-                        pickle.dump(tokenized_docs, f)
-                        
-                    logging.info("✅ Created and saved BM25 index")
-                except Exception as e:
-                    logging.error(f"Error creating BM25 index: {e}")
-                    bm25_index = None
-                    tokenized_docs = None
+            logging.error("❌ Failed to initialize RAG data from image directory")
+    
+    # Create BM25 index for backward compatibility
+    try:
+        if df is not None and 'text' in df.columns:
+            if os.path.exists(BM25_INDEX_PATH) and os.path.exists(TOKENIZED_PARAGRAPHS_PATH):
+                with open(BM25_INDEX_PATH, "rb") as f:
+                    bm25_index = pickle.load(f)
+                with open(TOKENIZED_PARAGRAPHS_PATH, "rb") as f:
+                    tokenized_docs = pickle.load(f)
+                logging.info("✅ Loaded BM25 index")
             else:
-                bm25_index = None
-                tokenized_docs = None
+                # Create BM25 index
+                logging.info("Creating BM25 index...")
+                from rank_bm25 import BM25Okapi
+                import nltk
+                from nltk.tokenize import word_tokenize
+                
+                # Ensure NLTK data is available
+                try:
+                    nltk.data.find('tokenizers/punkt')
+                except LookupError:
+                    nltk.download('punkt')
+                
+                # Tokenize documents
+                tokenized_docs = []
+                for _, row in df.iterrows():
+                    if row['text']:
+                        tokenized_docs.append(word_tokenize(row['text'].lower()))
+                    else:
+                        tokenized_docs.append([])
+                
+                # Create index
+                bm25_index = BM25Okapi(tokenized_docs)
+                
+                # Save for future use
+                with open(BM25_INDEX_PATH, "wb") as f:
+                    pickle.dump(bm25_index, f)
+                with open(TOKENIZED_PARAGRAPHS_PATH, "wb") as f:
+                    pickle.dump(tokenized_docs, f)
+                logging.info("✅ Created and saved BM25 index")
     except Exception as e:
-        logging.error(f"Error loading BM25 index: {e}")
+        logging.error(f"Error with BM25 index: {e}")
         bm25_index = None
         tokenized_docs = None
-        
-    # Create directories if they don't exist
+    
+    # Create necessary directories
     os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
     os.makedirs(HEATMAP_DIR, exist_ok=True)
     os.makedirs(PDF_IMAGES_DIR, exist_ok=True)
     os.makedirs(TEMPLATES_DIR, exist_ok=True)
     
-    # Verify embeddings type compatibility
-    if colpali_embeddings is not None:
-        try:
-            if isinstance(colpali_embeddings, list) and len(colpali_embeddings) > 0:
-                sample_embedding = colpali_embeddings[0]
-                logging.info(f"Embeddings type: {type(sample_embedding)}")
-                
-                if not isinstance(sample_embedding, (np.ndarray, torch.Tensor)):
-                    logging.warning(f"⚠️ Embeddings are not numpy arrays or torch tensors: {type(sample_embedding)}")
-        except Exception as e:
-            logging.error(f"Error checking embeddings type: {e}")
-    
-    # Summary of loaded components
-    logging.info("=== RAG Data Loading Summary ===")
-    logging.info(f"DataFrame: {'✅ Loaded' if df is not None and len(df) > 0 else '❌ Not available'}")
-    logging.info(f"Page Images: {'✅ Loaded' if page_images and len(page_images) > 0 else '❌ Not available'}")
-    logging.info(f"ColPali Embeddings: {'✅ Loaded' if colpali_embeddings is not None else '❌ Not available'}")
-    logging.info(f"BM25 Index: {'✅ Loaded' if bm25_index is not None else '❌ Not available'}")
-    
-    # Check if all necessary components are available
-    if colpali_embeddings is None or df is None or len(df) == 0:
-        logging.warning("⚠️ RAG system is not fully initialized. Some features may be limited.")
-        logging.warning("⚠️ Please run embedding.py to generate embeddings from PDF documents.")
-    else:
-        logging.info("✅ RAG system is fully initialized and ready to use.")
+    # Log final status
+    logging.info("=== RAG Data Status ===")
+    logging.info(f"DataFrame: {'✅ Available' if df is not None and len(df) > 0 else '❌ Missing'}")
+    logging.info(f"Page Images: {'✅ Available' if page_images and len(page_images) > 0 else '❌ Missing'}")
+    logging.info(f"ColPali Embeddings: {'✅ Available' if colpali_embeddings is not None else '❌ Missing'}")
 
 
 def retrieve_visually_similar_documents(query_image_data: str, top_k=3):
@@ -678,171 +771,112 @@ def calculate_visual_similarity(query_embedding, doc_embedding):
 
 # Retrieve relevant documents for RAG
 async def retrieve_relevant_documents(query, top_k=5):
-    """Retrieve most relevant documents using embeddings and BM25"""
-    global colpali_embeddings, df, bm25_index, tokenized_docs
+    """Retrieve most relevant documents using visual embeddings similarity"""
+    global colpali_embeddings, df, page_images
     
     if colpali_embeddings is None or df is None or len(df) == 0:
         logging.error("No documents or embeddings available for retrieval")
         return [], []
         
-    retrieved_paragraphs = []
+    retrieved_images = []
     top_sources_data = []
     
-    # First try using sentence-transformers for vector search
     try:
+        # Initialize sentence-transformer model for query embedding
         from sentence_transformers import SentenceTransformer, util
         
-        # Initialize sentence-transformer model if needed for vector search
+        # Create a query embedding using the text encoder
         model = SentenceTransformer('all-MiniLM-L6-v2')
         query_embedding = model.encode(query, convert_to_tensor=True)
         
         # Convert colpali embeddings to tensors for similarity comparison
-        # Assuming colpali_embeddings is a list of numpy arrays
-        document_embeddings = [torch.tensor(emb) for emb in colpali_embeddings]
+        document_embeddings = []
+        for emb in colpali_embeddings:
+            if isinstance(emb, np.ndarray):
+                document_embeddings.append(torch.tensor(emb))
+            elif isinstance(emb, torch.Tensor):
+                document_embeddings.append(emb)
+            else:
+                logging.warning(f"Unexpected embedding type: {type(emb)}, trying to convert to tensor")
+                try:
+                    document_embeddings.append(torch.tensor(np.array(emb)))
+                except:
+                    logging.error(f"Could not convert embedding to tensor")
+                    continue
         
-        # Calculate similarities
+        # Calculate similarities between query embedding and document visual embeddings
         similarities = []
         for idx, doc_emb in enumerate(document_embeddings):
-            # Ensure embeddings have same dimensions
-            if len(doc_emb.shape) > 1 and doc_emb.shape[0] > 1:
-                # If document has multiple vectors, take max similarity
-                # Reshape to match dimensions for comparison
-                doc_emb_reshaped = doc_emb.reshape(-1, doc_emb.shape[-1])
-                sim = util.pytorch_cos_sim(query_embedding, doc_emb_reshaped).max().item()
-            else:
-                # Single vector case
-                sim = util.pytorch_cos_sim(query_embedding, doc_emb).item()
-            
-            similarities.append((idx, sim))
+            try:
+                # Ensure embeddings have compatible dimensions for comparison
+                if len(doc_emb.shape) > 1 and doc_emb.shape[0] > 1:
+                    # If document has multiple vectors, take max similarity
+                    # Reshape to match dimensions for comparison
+                    doc_emb_reshaped = doc_emb.reshape(-1, doc_emb.shape[-1])
+                    sim = util.pytorch_cos_sim(query_embedding, doc_emb_reshaped).max().item()
+                else:
+                    # Single vector case
+                    sim = util.pytorch_cos_sim(query_embedding, doc_emb).item()
+                
+                similarities.append((idx, sim))
+            except Exception as e:
+                logging.error(f"Error calculating similarity for document {idx}: {e}")
+                similarities.append((idx, 0.0))
         
         # Sort by similarity score
         similarities.sort(key=lambda x: x[1], reverse=True)
-        vector_top_indices = [idx for idx, _ in similarities[:top_k]]
         
-        # Try BM25 keyword search if available
-        keyword_top_indices = []
-        bm25_scores = None
-        if bm25_index is not None and tokenized_docs is not None:
-            try:
-                # Tokenize query and get BM25 scores
-                tokenized_query = word_tokenize(query.lower())
-                bm25_scores = bm25_index.get_scores(tokenized_query)
-                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
-            except Exception as e:
-                logging.error(f"Error in BM25 scoring: {e}")
+        # Get top K most similar documents
+        top_indices = [idx for idx, _ in similarities[:top_k]]
         
-        # Create BM25 index if it doesn't exist yet
-        elif df is not None and len(df) > 0:
-            try:
-                logging.info("Building BM25 index from document texts")
-                # Tokenize all documents
-                tokenized_docs = []
-                for _, row in df.iterrows():
-                    tokenized_docs.append(word_tokenize(row['text'].lower()))
-                
-                # Create BM25 index
-                bm25_index = BM25Okapi(tokenized_docs)
-                
-                # Get scores for the current query
-                tokenized_query = word_tokenize(query.lower())
-                bm25_scores = bm25_index.get_scores(tokenized_query)
-                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
-                
-                # Save the index and tokenized documents for future use
-                os.makedirs(DATA_DIR, exist_ok=True)
-                with open(os.path.join(DATA_DIR, "bm25_index.pkl"), "wb") as f:
-                    pickle.dump(bm25_index, f)
-                with open(os.path.join(DATA_DIR, "tokenized_paragraphs.pkl"), "wb") as f:
-                    pickle.dump(tokenized_docs, f)
-                    
-                logging.info("Created and saved BM25 index")
-            except Exception as e:
-                logging.error(f"Error creating BM25 index: {e}")
-        
-        # Combine results (hybrid retrieval)
-        all_indices = list(set(vector_top_indices + keyword_top_indices))
-        
-        # Get data for reranking
-        docs_for_reranking = []
-        doc_indices = []
-        
-        for idx in all_indices:
+        # Collect the data for the top documents
+        for idx in top_indices:
             if idx < len(df):
-                # Get document info
-                filename = df.iloc[idx]['filename']
-                page_num = df.iloc[idx]['page']
-                image_key = df.iloc[idx]['image_key']
-                text = df.iloc[idx]['text']
-                
-                # Get vector score
-                vector_score = 0.0
-                for v_idx, score in similarities:
-                    if v_idx == idx:
-                        vector_score = score
-                        break
-                
-                # Get keyword score (if available)
-                keyword_score = 0.0
-                if bm25_scores is not None and len(bm25_scores) > idx:
-                    keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
-                
-                # Combine scores (weighted)
-                alpha = 0.7  # Weight for vector search
-                combined_score = alpha * vector_score + (1 - alpha) * keyword_score
-                
-                # Store for reranking
-                docs_for_reranking.append(text)
-                doc_indices.append(idx)
-                
-                # Add to results
-                retrieved_paragraphs.append(text)
-                top_sources_data.append({
-                    'filename': filename,
-                    'page': page_num,
-                    'score': combined_score,
-                    'vector_score': vector_score,
-                    'keyword_score': keyword_score,
-                    'image_key': image_key,
-                    'idx': idx
-                })
+                try:
+                    # Get document info
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    
+                    # Get the similarity score
+                    score = 0.0
+                    for sim_idx, sim_score in similarities:
+                        if sim_idx == idx:
+                            score = sim_score
+                            break
+                    
+                    # Get the image path
+                    image_path = None
+                    if image_key in page_images:
+                        image_path = page_images[image_key]
+                    
+                    # Add to results
+                    if image_path and os.path.exists(image_path):
+                        try:
+                            # Load the image for context
+                            image = Image.open(image_path)
+                            retrieved_images.append(image)
+                            
+                            # Add metadata to sources
+                            top_sources_data.append({
+                                'filename': filename,
+                                'page': page_num,
+                                'score': score,
+                                'image_key': image_key,
+                                'image_path': image_path,
+                                'idx': idx
+                            })
+                        except Exception as e:
+                            logging.error(f"Error loading image from {image_path}: {e}")
+                except Exception as e:
+                    logging.error(f"Error processing document at index {idx}: {e}")
         
-        # Rerank results if we have documents
-        if docs_for_reranking:
-            try:
-                # Use a cross-encoder reranker
-                ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
-                ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
-                top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
-                
-                # Get the final top documents after reranking
-                final_retrieved_paragraphs = []
-                final_top_sources = []
-                
-                for ranked_doc in top_ranked:
-                    ranked_idx = docs_for_reranking.index(ranked_doc.text)
-                    doc_idx = doc_indices[ranked_idx]
-                    source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
-                    if source_info:
-                        source_info['reranker_score'] = ranked_doc.score
-                        final_top_sources.append(source_info)
-                        final_retrieved_paragraphs.append(ranked_doc.text)
-                
-                return final_retrieved_paragraphs, final_top_sources
-                
-            except Exception as e:
-                logging.error(f"Error in reranking: {e}")
-        
-        # If reranking fails, sort by combined score
-        sorted_indices = sorted(range(len(top_sources_data)), 
-                               key=lambda i: top_sources_data[i]['score'], 
-                               reverse=True)
-        sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
-        sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
-        
-        return sorted_paragraphs, sorted_sources
+        logging.info(f"Retrieved {len(retrieved_images)} images as context")
+        return retrieved_images, top_sources_data
         
     except Exception as e:
-        logging.error(f"Error in document retrieval: {str(e)}")
+        logging.error(f"Error in visual document retrieval: {str(e)}")
+        import traceback
         traceback.print_exc()
         return [], []
 
@@ -1314,16 +1348,16 @@ def generate_flowbite_table_rows(results):
     timeout=300,
     volumes={DATA_DIR: bee_volume}
 )
-def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
+async def classify_document_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
     """
-    Classify insect in image using Claude's API, sending document images directly
+    Classify document using Claude's Vision capabilities, treating it purely as an image
     
     Args:
-        image_data: Base64 encoded image
+        image_data: Base64 encoded image of the document
         options: Dictionary of toggle options
     
     Returns:
-        Dictionary with classification results
+        Dictionary with classification and analysis results
     """
     result_id = uuid.uuid4().hex
     
@@ -1331,92 +1365,76 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
     additional_instructions = []
     format_instructions = []
     
-    if options.get("detailed_description", False):
-        additional_instructions.append("Provide a detailed description of the insect, focusing on shapes and colors visible in the image.")
-        format_instructions.append("- Detailed Description: [shapes, colors, and distinctive features]")
+    if options.get("detailed_analysis", False):
+        additional_instructions.append("Provide a detailed analysis of the document, focusing on its visual structure, layout, and any visible elements.")
+        format_instructions.append("- Detailed Analysis: [description of document structure and layout]")
         
-    if options.get("plant_classification", False):
-        additional_instructions.append("If there are any plants visible in the image, identify them to the best of your ability.")
-        format_instructions.append("- Plant Identification: [names of visible plants, if any]")
+    if options.get("extract_key_points", False):
+        additional_instructions.append("Extract key points visible in the document without using OCR or text extraction.")
+        format_instructions.append("- Key Points: [list of main points visible in the document]")
         
-    if options.get("taxonomy", False):
-        additional_instructions.append("Provide taxonomic classification of the insect to the most specific level possible (Order, Family, Genus, Species).")
-        format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
+    if options.get("identify_document_type", False):
+        additional_instructions.append("Identify the document type based on its visual appearance.")
+        format_instructions.append("- Document Type: [invoice, report, form, etc.]")
     
-    # Get relevant context (document images) using visual similarity
+    # Get relevant context documents using RAG retrieval
+    context_text = ""
     context_source = None
-    context_image_data = None
+    context_images = []
     top_sources = []
     
     # Check if RAG is available and enabled
     rag_enabled = options.get("use_rag", True)
-    rag_available = colpali_embeddings is not None and len(page_images) > 0
+    rag_available = colpali_embeddings is not None and df is not None and len(df) > 0
     
-    if rag_enabled and rag_available:
-        try:
-            # Get visually similar document pages
-            top_sources = retrieve_visually_similar_documents(image_data, top_k=3)
-            
-            if top_sources and len(top_sources) > 0:
-                source = top_sources[0]
-                context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
-                logging.info(f"Using context source: {context_source}")
-                
-                # Get the context image with more robust path resolution
-                context_image_path = get_context_image_path([source])
-                if context_image_path and os.path.exists(context_image_path):
-                    # Convert context image to base64
-                    with open(context_image_path, "rb") as f:
-                        context_image_data = base64.b64encode(f.read()).decode('utf-8')
-                    logging.info(f"Found context image: {context_image_path}")
-                else:
-                    logging.warning(f"Could not find context image for {context_source}")
-        except Exception as e:
-            logging.error(f"Error retrieving context: {e}")
-            import traceback
-            traceback.print_exc()
+    if rag_enabled:
+        if rag_available:
+            query = "document analysis" # General query for document context
+            try:
+                # Use the vision retrieval function to get similar document images
+                context_images, top_sources = await retrieve_relevant_documents(query, top_k=3)
+                logging.info(f"Retrieved {len(context_images)} context images and {len(top_sources)} top sources")
+
+                if context_images and top_sources and len(top_sources) > 0:
+                    source = top_sources[0]
+                    context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                    logging.info(f"Using context source: {context_source}")
+            except Exception as e:
+                logging.error(f"Error retrieving context: {e}")
+                import traceback
+                traceback.print_exc()
+                # Continue without context if retrieval fails
+        else:
+            logging.warning("RAG requested but data not available. Proceeding without context")
     
-    # Prepare the prompt - updated for image-based context
-    categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
-    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
-    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
+    # Build the prompt for document analysis - treating the document as a pure image
+    document_analysis_prompt = """
+    You are an expert document analyst. Your task is to analyze the provided document image and provide detailed insights.
     
-    # Create context instructions based on whether we have a context image
-    image_context_instructions = ""
-    if context_image_data:
-        image_context_instructions = """
-I am also providing a SECOND IMAGE that contains reference information about insects.
-This second image is a document page that may help with your classification.
-Please examine both images, using the document image to inform your analysis of the insect.
-"""
-    
-    # Format the prompt
-    prompt = """
-    You are an expert entomologist specializing in insect identification. Your task is to analyze the 
-    provided insect image and classify the insect(s) visible.
-    
-    Please categorize the insect into one of these categories:
-    {categories}
-    
-    {image_context_instructions}
+    Please analyze the document based on its visual appearance without performing explicit OCR or text extraction.
+    Focus on what you can observe directly in the image - layout, structure, visual elements, and general content.
     
     {additional_instructions}
     
     Format your response as follows:
-    - Main Category: [the most likely category from the list]
-    - Confidence: [High, Medium, or Low]
-    - Description: [brief description of what you see]
+    - Document Overview: [brief description of what you see]
+    - Visual Structure: [description of layout and visual organization]
+    - Content Type: [what kind of content appears to be in the document]
     {format_instructions}
     
     IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
-    """.format(
-        categories=categories_list,
-        image_context_instructions=image_context_instructions,
+    """
+    
+    # Prepare the prompt
+    additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
+    format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
+    
+    prompt = document_analysis_prompt.format(
         additional_instructions=additional_instructions_text,
         format_instructions=format_instructions_text
     )
     
-    print("🔍 Sending images to Claude for classification...")
+    print("🔍 Sending document image to Claude for visual analysis...")
     
     try:
         # Prepare the request for Claude API
@@ -1429,7 +1447,7 @@ Please examine both images, using the document image to inform your analysis of 
         # Build content array for the message
         content = []
         
-        # Add the input image
+        # Add the input document image
         content.append({
             "type": "image",
             "source": {
@@ -1439,8 +1457,16 @@ Please examine both images, using the document image to inform your analysis of 
             }
         })
         
-        # Add the context image if available
-        if context_image_data:
+        # Add context images if available
+        for i, context_image in enumerate(context_images):
+            if i >= 2:  # Limit to 2 context images to avoid token limits
+                break
+                
+            # Convert PIL Image to base64
+            buffered = BytesIO()
+            context_image.save(buffered, format="JPEG", quality=85)
+            context_image_data = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            
             content.append({
                 "type": "image",
                 "source": {
@@ -1469,8 +1495,8 @@ Please examine both images, using the document image to inform your analysis of 
         
         # Log what's being sent to the API
         logging.info(f"Sending request to Claude API with {len(content)} content items")
-        if context_image_data:
-            logging.info("Including context image in request")
+        if context_images:
+            logging.info(f"Including {len(context_images)} context images in request")
         
         # Make the API call
         response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
@@ -1478,11 +1504,10 @@ Please examine both images, using the document image to inform your analysis of 
         
         # Extract the response content
         result = response.json()
-        classification_text = result["content"][0]["text"]
+        analysis_text = result["content"][0]["text"]
         
-        # Parse the classification result
-        # Simple parsing based on the expected format
-        lines = classification_text.strip().split("\n")
+        # Parse the analysis result
+        lines = analysis_text.strip().split("\n")
         parsed_result = {}
         
         for line in lines:
@@ -1493,9 +1518,9 @@ Please examine both images, using the document image to inform your analysis of 
                 parsed_result[key] = value
         
         # Store essential information
-        category = parsed_result.get("Main Category", "Unclassified")
-        confidence = parsed_result.get("Confidence", "Low")
-        description = parsed_result.get("Description", "No description provided")
+        document_overview = parsed_result.get("Document Overview", "No overview provided")
+        visual_structure = parsed_result.get("Visual Structure", "Structure not analyzed")
+        content_type = parsed_result.get("Content Type", "Unknown")
         
         # Store the full result in the database
         try:
@@ -1505,7 +1530,7 @@ Please examine both images, using the document image to inform your analysis of 
             # Include context_source in the insert
             cursor.execute(
                 "INSERT INTO results (id, category, confidence, description, additional_details, context_source) VALUES (?, ?, ?, ?, ?, ?)",
-                (result_id, category, confidence, description, json.dumps(parsed_result), context_source)
+                (result_id, content_type, "Medium", document_overview, json.dumps(parsed_result), context_source)
             )
             
             conn.commit()
@@ -1513,16 +1538,16 @@ Please examine both images, using the document image to inform your analysis of 
             
             return {
                 "id": result_id,
-                "category": category,
-                "confidence": confidence,
-                "description": description,
+                "document_type": content_type,
+                "overview": document_overview,
+                "visual_structure": visual_structure,
                 "details": parsed_result,
                 "context_source": context_source,
                 "top_sources": top_sources,
                 "rag_available": rag_available,
                 "rag_enabled": rag_enabled,
-                "context_image_used": context_image_data is not None,
-                "raw_response": classification_text
+                "context_images_used": len(context_images),
+                "raw_response": analysis_text
             }
             
         except Exception as db_error:
@@ -1530,21 +1555,21 @@ Please examine both images, using the document image to inform your analysis of 
             # Still return the result even if database save fails
             return {
                 "id": result_id,
-                "category": category,
-                "confidence": confidence,
-                "description": description,
+                "document_type": content_type,
+                "overview": document_overview,
+                "visual_structure": visual_structure,
                 "details": parsed_result,
                 "context_source": context_source,
                 "top_sources": top_sources,
-                "rag_available": rag_available,  
+                "rag_available": rag_available,
                 "rag_enabled": rag_enabled,
-                "context_image_used": context_image_data is not None,
-                "raw_response": classification_text,
+                "context_images_used": len(context_images),
+                "raw_response": analysis_text,
                 "db_error": str(db_error)
             }
             
     except Exception as e:
-        print(f"⚠️ Error in classification: {e}")
+        print(f"⚠️ Error in document classification: {e}")
         return {
             "error": str(e),
             "id": result_id
@@ -3109,6 +3134,107 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
+
+
+    #################################################
+    # API route for document analysis - treating documents as pure images
+    #################################################
+    @rt("/analyze-document", methods=["POST"])
+    async def api_analyze_document(request):
+        """API endpoint to analyze document as a pure image using Claude's Vision API"""
+        try:
+            # Get image data and options from request JSON
+            data = await request.json()
+            image_data = data.get("image_data", "")
+            options = data.get("options", {})
+            
+            if not image_data:
+                return JSONResponse({"error": "No document image data provided"}, status_code=400)
+            
+            # Add document-specific options if not present
+            if "detailed_analysis" not in options:
+                options["detailed_analysis"] = True
+            if "extract_key_points" not in options:
+                options["extract_key_points"] = True
+            if "identify_document_type" not in options:
+                options["identify_document_type"] = True
+            
+            # Call the document classification function
+            result = classify_document_claude.remote(image_data, options)
+            
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error analyzing document: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    #################################################
+    # API route for batch document analysis
+    #################################################
+    @rt("/analyze-documents-batch", methods=["POST"])
+    async def api_analyze_documents_batch(request):
+        """API endpoint to analyze multiple documents as images in batch mode"""
+        try:
+            # Get form data with files
+            form = await request.form()
+            options_json = form.get("options", "{}")
+            options = json.loads(options_json)
+            
+            # Extract document files
+            document_files = []
+            for key in form.keys():
+                if key.startswith("document_"):
+                    document_files.append(form.get(key))
+                        
+            if not document_files:
+                return JSONResponse({"error": "No documents provided"}, status_code=400)
+                    
+            # Limit to 5 documents per batch
+            if len(document_files) > 5:
+                document_files = document_files[:5]
+                    
+            # Process each document
+            base64_images = []
+            for file in document_files:
+                # Read file content
+                content = await file.read()
+                    
+                # Convert to base64
+                base64_data = base64.b64encode(content).decode("utf-8")
+                base64_images.append(base64_data)
+                    
+            if not base64_images:
+                return JSONResponse({"error": "Failed to process documents"}, status_code=400)
+            
+            # Add document-specific options if not present
+            if "detailed_analysis" not in options:
+                options["detailed_analysis"] = True
+            if "extract_key_points" not in options:
+                options["extract_key_points"] = True
+            if "identify_document_type" not in options:
+                options["identify_document_type"] = True
+                    
+            # Call batch analysis function - you'll need to implement this separately
+            # For now, we'll just call the single document function for each document
+            results = []
+            for image_data in base64_images:
+                result = classify_document_claude.remote(image_data, options)
+                results.append(result)
+                
+            # Return the batch results
+            return JSONResponse({
+                "batch_id": uuid.uuid4().hex,
+                "count": len(results),
+                "results": results
+            })
+                    
+        except Exception as e:
+            print(f"Error in batch document analysis: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
 #################################################
     # API route for chart data
     #################################################
@@ -3969,6 +4095,7 @@ def serve():
 #################################################
     # API route for image classification - FIXED FOR ASYNC/AWAIT ISSUE
     #################################################
+    # In app.py, locate the API endpoint for /classify
     @rt("/classify", methods=["POST"])
     async def api_classify_image(request):
         """API endpoint to classify insect image using Claude with RAG"""
@@ -3981,10 +4108,15 @@ def serve():
             if not image_data:
                 return JSONResponse({"error": "No image data provided"}, status_code=400)
             
-            result = classify_image_claude.remote(image_data, options)
+            # CHANGE THIS LINE to match your actual function name
+            # If your function is named classify_document_claude:
+            result = classify_document_claude.remote(image_data, options)
+            
+            # Or if your function doesn't exist, uncomment this to create it with the expected name:
+            # result = classify_image_claude.remote(image_data, options)
             
             return JSONResponse(result)
-                
+                    
         except Exception as e:
             print(f"Error classifying image: {e}")
             import traceback
