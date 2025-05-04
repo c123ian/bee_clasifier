@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -86,14 +86,15 @@ except modal.exception.NotFoundError:
     bee_volume = modal.Volume.persisted("bee_volume")
 
 # Base prompt template for Claude with context
+# Replace the existing CLASSIFICATION_PROMPT with this:
 CLASSIFICATION_PROMPT = """
 You are an expert entomologist specializing in insect identification. Your task is to analyze the 
-provided image and classify the insect(s) visible.
+provided insect image and classify the insect(s) visible.
 
 Please categorize the insect into one of these categories:
 {categories}
 
-{context_text}
+{image_context_instructions}
 
 {additional_instructions}
 
@@ -114,7 +115,7 @@ images of insects and classify each one.
 For EACH image, categorize the insect into one of these categories:
 {categories}
 
-{context_text}
+{image_context_instructions}
 
 {additional_instructions}
 
@@ -561,6 +562,120 @@ def load_rag_data():
     else:
         logging.info("✅ RAG system is fully initialized and ready to use.")
 
+
+def retrieve_visually_similar_documents(query_image_data: str, top_k=3):
+    """Retrieve visually similar document pages using the ColQwen2 embeddings"""
+    global colpali_embeddings, df, page_images
+    
+    if colpali_embeddings is None or df is None or len(df) == 0 or not page_images:
+        logging.error("No document embeddings or images available for retrieval")
+        return []
+    
+    retrieved_sources = []
+    
+    try:
+        # Convert base64 query image to proper format for embedding
+        query_image_bytes = base64.b64decode(query_image_data)
+        query_image = Image.open(BytesIO(query_image_bytes))
+        
+        # Use ColQwen2 to generate embedding for query image
+        query_embedding = generate_image_embedding(query_image)
+        
+        # Calculate similarities
+        similarities = []
+        for idx, doc_emb in enumerate(colpali_embeddings):
+            if idx < len(df):
+                try:
+                    # Calculate visual similarity
+                    similarity = calculate_visual_similarity(query_embedding, doc_emb)
+                    
+                    # Get document info
+                    filename = df.iloc[idx]['filename']
+                    page_num = df.iloc[idx]['page']
+                    image_key = df.iloc[idx]['image_key']
+                    
+                    # Store for ranking
+                    similarities.append({
+                        'idx': idx,
+                        'score': similarity,
+                        'filename': filename,
+                        'page': page_num,
+                        'image_key': image_key
+                    })
+                except Exception as e:
+                    logging.error(f"Error calculating similarity for document {idx}: {e}")
+        
+        # Sort by similarity score
+        similarities.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Return top_k results
+        return similarities[:top_k]
+        
+    except Exception as e:
+        logging.error(f"Error in visual document retrieval: {str(e)}")
+        traceback.print_exc()
+        return []
+
+def generate_image_embedding(image):
+    """Generate an embedding for an image using the ColQwen2 model"""
+    try:
+        # Import necessary components
+        from colpali_engine.models import ColQwen2, ColQwen2Processor
+        
+        # Use the same model as in embedding.py
+        model_name = "vidore/colqwen2-v1.0"
+        
+        # Load model if not already loaded
+        global colqwen2_model, colqwen2_processor
+        if 'colqwen2_model' not in globals() or colqwen2_model is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            colqwen2_model = ColQwen2.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=device
+            ).eval()
+            colqwen2_processor = ColQwen2Processor.from_pretrained(model_name)
+        
+        # Process the image
+        processed = colqwen2_processor.process_images([image]).to(colqwen2_model.device)
+        
+        # Generate embedding
+        with torch.no_grad():
+            embedding = colqwen2_model(**processed)
+        
+        return embedding
+        
+    except Exception as e:
+        logging.error(f"Error generating image embedding: {e}")
+        return None
+
+def calculate_visual_similarity(query_embedding, doc_embedding):
+    """Calculate visual similarity between two embeddings"""
+    try:
+        # Convert to same tensor type if needed
+        if isinstance(query_embedding, torch.Tensor) and isinstance(doc_embedding, np.ndarray):
+            doc_embedding = torch.tensor(doc_embedding, device=query_embedding.device)
+        elif isinstance(query_embedding, np.ndarray) and isinstance(doc_embedding, torch.Tensor):
+            query_embedding = torch.tensor(query_embedding, device=doc_embedding.device)
+        
+        # Calculate cosine similarity
+        if isinstance(query_embedding, torch.Tensor) and isinstance(doc_embedding, torch.Tensor):
+            query_norm = torch.nn.functional.normalize(query_embedding, p=2, dim=-1)
+            doc_norm = torch.nn.functional.normalize(doc_embedding, p=2, dim=-1)
+            similarity = torch.sum(query_norm * doc_norm).item()
+        else:
+            # Numpy fallback
+            from sklearn.metrics.pairwise import cosine_similarity
+            query_flat = query_embedding.reshape(1, -1)
+            doc_flat = doc_embedding.reshape(1, -1)
+            similarity = cosine_similarity(query_flat, doc_flat)[0][0]
+        
+        return similarity
+        
+    except Exception as e:
+        logging.error(f"Error calculating visual similarity: {e}")
+        return 0.0
+
 # Retrieve relevant documents for RAG
 async def retrieve_relevant_documents(query, top_k=5):
     """Retrieve most relevant documents using embeddings and BM25"""
@@ -731,203 +846,7 @@ async def retrieve_relevant_documents(query, top_k=5):
         traceback.print_exc()
         return [], []
 
-# synchronous wrapper for the async retrieve_relevant_documents
-async def retrieve_relevant_documents(query, top_k=5):
-    """Retrieve most relevant documents using embeddings and BM25"""
-    global colpali_embeddings, df, bm25_index, tokenized_docs
-    
-    if colpali_embeddings is None or df is None or len(df) == 0:
-        logging.error("No documents or embeddings available for retrieval")
-        return [], []
-        
-    retrieved_paragraphs = []
-    top_sources_data = []
-    
-    # First try using sentence-transformers for vector search
-    try:
-        from sentence_transformers import SentenceTransformer, util
-        
-        # Initialize sentence-transformer model if needed for vector search
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        query_embedding = model.encode(query, convert_to_tensor=True)
-        
-        # Convert colpali embeddings to tensors for similarity comparison
-        # Assuming colpali_embeddings is a list of numpy arrays
-        document_embeddings = []
-        for emb in colpali_embeddings:
-            if isinstance(emb, np.ndarray):
-                document_embeddings.append(torch.tensor(emb))
-            elif isinstance(emb, torch.Tensor):
-                document_embeddings.append(emb)
-            else:
-                logging.warning(f"Unexpected embedding type: {type(emb)}, trying to convert to tensor")
-                try:
-                    document_embeddings.append(torch.tensor(np.array(emb)))
-                except:
-                    logging.error(f"Could not convert embedding to tensor")
-                    continue
-        
-        # Calculate similarities
-        similarities = []
-        for idx, doc_emb in enumerate(document_embeddings):
-            try:
-                # Ensure embeddings have same dimensions
-                if len(doc_emb.shape) > 1 and doc_emb.shape[0] > 1:
-                    # If document has multiple vectors, take max similarity
-                    # Reshape to match dimensions for comparison
-                    doc_emb_reshaped = doc_emb.reshape(-1, doc_emb.shape[-1])
-                    sim = util.pytorch_cos_sim(query_embedding, doc_emb_reshaped).max().item()
-                else:
-                    # Single vector case
-                    sim = util.pytorch_cos_sim(query_embedding, doc_emb).item()
-                
-                similarities.append((idx, sim))
-            except Exception as e:
-                logging.error(f"Error calculating similarity for document {idx}: {e}")
-                similarities.append((idx, 0.0))
-        
-        # Sort by similarity score
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        vector_top_indices = [idx for idx, _ in similarities[:top_k]]
-        
-        # Try BM25 keyword search if available
-        keyword_top_indices = []
-        bm25_scores = None
-        if bm25_index is not None and tokenized_docs is not None:
-            try:
-                # Tokenize query and get BM25 scores
-                tokenized_query = word_tokenize(query.lower())
-                bm25_scores = bm25_index.get_scores(tokenized_query)
-                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
-            except Exception as e:
-                logging.error(f"Error in BM25 scoring: {e}")
-        
-        # Create BM25 index if it doesn't exist yet
-        elif df is not None and len(df) > 0:
-            try:
-                from rank_bm25 import BM25Okapi
-                logging.info("Building BM25 index from document texts")
-                
-                # Tokenize all documents
-                tokenized_docs = []
-                for _, row in df.iterrows():
-                    tokenized_docs.append(word_tokenize(row['text'].lower()))
-                
-                # Create BM25 index
-                bm25_index = BM25Okapi(tokenized_docs)
-                
-                # Get scores for the current query
-                tokenized_query = word_tokenize(query.lower())
-                bm25_scores = bm25_index.get_scores(tokenized_query)
-                keyword_top_indices = np.argsort(bm25_scores)[-top_k:][::-1].tolist()
-                
-                # Save the index and tokenized documents for future use
-                os.makedirs(DATA_DIR, exist_ok=True)
-                with open(os.path.join(DATA_DIR, "bm25_index.pkl"), "wb") as f:
-                    pickle.dump(bm25_index, f)
-                with open(os.path.join(DATA_DIR, "tokenized_paragraphs.pkl"), "wb") as f:
-                    pickle.dump(tokenized_docs, f)
-                    
-                logging.info("Created and saved BM25 index")
-            except Exception as e:
-                logging.error(f"Error creating BM25 index: {e}")
-        
-        # Combine results (hybrid retrieval)
-        all_indices = list(set(vector_top_indices + keyword_top_indices))
-        logging.info(f"Combined {len(vector_top_indices)} vector and {len(keyword_top_indices)} keyword indices into {len(all_indices)} unique indices")
-        
-        # Get data for reranking
-        docs_for_reranking = []
-        doc_indices = []
-        
-        for idx in all_indices:
-            if idx < len(df):
-                try:
-                    # Get document info
-                    filename = df.iloc[idx]['filename']
-                    page_num = df.iloc[idx]['page']
-                    image_key = df.iloc[idx]['image_key']
-                    text = df.iloc[idx]['text']
-                    
-                    # Get vector score
-                    vector_score = 0.0
-                    for v_idx, score in similarities:
-                        if v_idx == idx:
-                            vector_score = score
-                            break
-                    
-                    # Get keyword score (if available)
-                    keyword_score = 0.0
-                    if bm25_scores is not None and len(bm25_scores) > idx:
-                        keyword_score = float(bm25_scores[idx] / max(bm25_scores) if max(bm25_scores) > 0 else 0)
-                    
-                    # Combine scores (weighted)
-                    alpha = 0.7  # Weight for vector search
-                    combined_score = alpha * vector_score + (1 - alpha) * keyword_score
-                    
-                    # Store for reranking
-                    docs_for_reranking.append(text)
-                    doc_indices.append(idx)
-                    
-                    # Add to results
-                    retrieved_paragraphs.append(text)
-                    top_sources_data.append({
-                        'filename': filename,
-                        'page': page_num,
-                        'score': combined_score,
-                        'vector_score': vector_score,
-                        'keyword_score': keyword_score,
-                        'image_key': image_key,
-                        'idx': idx
-                    })
-                except Exception as e:
-                    logging.error(f"Error processing document at index {idx}: {e}")
-        
-        # Rerank results if we have documents
-        if docs_for_reranking:
-            try:
-                # Use a cross-encoder reranker
-                from rerankers import Reranker
-                ranker = Reranker('cross-encoder/ms-marco-MiniLM-L-6-v2', model_type="cross-encoder", verbose=0)
-                ranked_results = ranker.rank(query=query, docs=docs_for_reranking)
-                top_ranked = ranked_results.top_k(min(3, len(docs_for_reranking)))
-                
-                # Get the final top documents after reranking
-                final_retrieved_paragraphs = []
-                final_top_sources = []
-                
-                for ranked_doc in top_ranked:
-                    ranked_idx = docs_for_reranking.index(ranked_doc.text)
-                    doc_idx = doc_indices[ranked_idx]
-                    source_info = next((s for s in top_sources_data if s['idx'] == doc_idx), None)
-                    if source_info:
-                        source_info['reranker_score'] = ranked_doc.score
-                        final_top_sources.append(source_info)
-                        final_retrieved_paragraphs.append(ranked_doc.text)
-                
-                logging.info(f"Retrieved and reranked {len(final_retrieved_paragraphs)} paragraphs")
-                return final_retrieved_paragraphs, final_top_sources
-                
-            except Exception as e:
-                logging.error(f"Error in reranking: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # If reranking fails, sort by combined score
-        sorted_indices = sorted(range(len(top_sources_data)), 
-                               key=lambda i: top_sources_data[i]['score'], 
-                               reverse=True)
-        sorted_paragraphs = [retrieved_paragraphs[i] for i in sorted_indices[:3]]
-        sorted_sources = [top_sources_data[i] for i in sorted_indices[:3]]
-        
-        logging.info(f"Retrieved {len(sorted_paragraphs)} paragraphs (fallback sorting)")
-        return sorted_paragraphs, sorted_sources
-        
-    except Exception as e:
-        logging.error(f"Error in document retrieval: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return [], []
+
 
 
 # Format image for API calls
@@ -1387,6 +1306,8 @@ def generate_flowbite_table_rows(results):
     return html
 
 # Generate classification using Claude's API for a single image
+# In app.py, modify the classify_image_claude function:
+
 @app.function(
     image=image,
     cpu=1.0,
@@ -1395,7 +1316,7 @@ def generate_flowbite_table_rows(results):
 )
 def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
     """
-    Classify insect in image using Claude's API based on provided options
+    Classify insect in image using Claude's API, sending document images directly
     
     Args:
         image_data: Base64 encoded image
@@ -1422,61 +1343,80 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
         additional_instructions.append("Provide taxonomic classification of the insect to the most specific level possible (Order, Family, Genus, Species).")
         format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
     
-    # Get relevant context using RAG retrieval
-    context_text = ""
+    # Get relevant context (document images) using visual similarity
     context_source = None
     context_image_data = None
-    retrieved_paragraphs = []
     top_sources = []
     
     # Check if RAG is available and enabled
     rag_enabled = options.get("use_rag", True)
-    rag_available = colpali_embeddings is not None and df is not None and len(df) > 0
+    rag_available = colpali_embeddings is not None and len(page_images) > 0
     
-    if rag_enabled:
-        if rag_available:
-            query = "insect classification"
-            try:
-                # Use the synchronous wrapper to call the async function
-                retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
-                logging.info(f"Retrieved {len(retrieved_paragraphs)} paragraphs and {len(top_sources)} top sources")
-
-                if retrieved_paragraphs:
-                    context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
-                    if top_sources and len(top_sources) > 0:
-                        source = top_sources[0]
-                        context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
-                        logging.info(f"Using context source: {context_source}")
-                        
-                        # Get the context image with more robust path resolution
-                        context_image = get_context_image(top_sources)
-                        if context_image:
-                            # Convert context image to base64
-                            logging.info(f"Found context image, converting to base64")
-                            context_image_data = format_image(context_image)
-                        else:
-                            logging.warning(f"Could not find context image for {context_source}")
-            except Exception as e:
-                logging.error(f"Error retrieving context: {e}")
-                import traceback
-                traceback.print_exc()
-                # Continue without context if retrieval fails
-        else:
-            logging.warning("RAG requested but data not available. Proceeding without context")
+    if rag_enabled and rag_available:
+        try:
+            # Get visually similar document pages
+            top_sources = retrieve_visually_similar_documents(image_data, top_k=3)
+            
+            if top_sources and len(top_sources) > 0:
+                source = top_sources[0]
+                context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                logging.info(f"Using context source: {context_source}")
+                
+                # Get the context image with more robust path resolution
+                context_image_path = get_context_image_path([source])
+                if context_image_path and os.path.exists(context_image_path):
+                    # Convert context image to base64
+                    with open(context_image_path, "rb") as f:
+                        context_image_data = base64.b64encode(f.read()).decode('utf-8')
+                    logging.info(f"Found context image: {context_image_path}")
+                else:
+                    logging.warning(f"Could not find context image for {context_source}")
+        except Exception as e:
+            logging.error(f"Error retrieving context: {e}")
+            import traceback
+            traceback.print_exc()
     
-    # Prepare the prompt
+    # Prepare the prompt - updated for image-based context
     categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
     additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
     format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
     
-    prompt = CLASSIFICATION_PROMPT.format(
+    # Create context instructions based on whether we have a context image
+    image_context_instructions = ""
+    if context_image_data:
+        image_context_instructions = """
+I am also providing a SECOND IMAGE that contains reference information about insects.
+This second image is a document page that may help with your classification.
+Please examine both images, using the document image to inform your analysis of the insect.
+"""
+    
+    # Format the prompt
+    prompt = """
+    You are an expert entomologist specializing in insect identification. Your task is to analyze the 
+    provided insect image and classify the insect(s) visible.
+    
+    Please categorize the insect into one of these categories:
+    {categories}
+    
+    {image_context_instructions}
+    
+    {additional_instructions}
+    
+    Format your response as follows:
+    - Main Category: [the most likely category from the list]
+    - Confidence: [High, Medium, or Low]
+    - Description: [brief description of what you see]
+    {format_instructions}
+    
+    IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
+    """.format(
         categories=categories_list,
-        context_text=context_text,
+        image_context_instructions=image_context_instructions,
         additional_instructions=additional_instructions_text,
         format_instructions=format_instructions_text
     )
     
-    print("🔍 Sending image to Claude for classification...")
+    print("🔍 Sending images to Claude for classification...")
     
     try:
         # Prepare the request for Claude API
@@ -1578,7 +1518,6 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
                 "description": description,
                 "details": parsed_result,
                 "context_source": context_source,
-                "context_paragraphs": retrieved_paragraphs,
                 "top_sources": top_sources,
                 "rag_available": rag_available,
                 "rag_enabled": rag_enabled,
@@ -1596,7 +1535,6 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
                 "description": description,
                 "details": parsed_result,
                 "context_source": context_source,
-                "context_paragraphs": retrieved_paragraphs,
                 "top_sources": top_sources,
                 "rag_available": rag_available,  
                 "rag_enabled": rag_enabled,
@@ -1653,32 +1591,80 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
         additional_instructions.append("Provide taxonomic classification of the insect to the most specific level possible (Order, Family, Genus, Species).")
         format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
     
-    # Get relevant context using RAG retrieval if enabled
-    context_text = ""
+    # Get relevant context using visual similarity with first image
+    # This is a simplification - in a more advanced implementation, you might
+    # want to get context relevant to all images, but for simplicity we'll use the first
     context_source = None
-    retrieved_paragraphs = []
+    context_image_data = None
     top_sources = []
     
-    if options.get("use_rag", True):  # Default to using RAG
-        query = "insect classification"
-        # Use the synchronous wrapper to call the async function
-        retrieved_paragraphs, top_sources = retrieve_relevant_documents(query, top_k=3)
-        
-        if retrieved_paragraphs:
-            context_text = "\n\nReference Information:\n" + "\n\n".join(retrieved_paragraphs)
+    if options.get("use_rag", True) and images_data and len(images_data) > 0:  # Default to using RAG
+        try:
+            # Use the first image in the batch to find relevant documents
+            query_image_data = images_data[0]
+            top_sources = retrieve_visually_similar_documents(query_image_data, top_k=1)
+            
             if top_sources and len(top_sources) > 0:
                 source = top_sources[0]
                 context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                
+                # Get the context image
+                context_image_path = get_context_image_path([source])
+                if context_image_path and os.path.exists(context_image_path):
+                    with open(context_image_path, "rb") as f:
+                        context_image_data = base64.b64encode(f.read()).decode('utf-8')
+                    logging.info(f"Found batch context image: {context_image_path}")
+        except Exception as e:
+            logging.error(f"Error retrieving batch context: {e}")
+            traceback.print_exc()
     
     # Prepare the batch prompt
     categories_list = "\n".join([f"- {category}" for category in INSECT_CATEGORIES])
     additional_instructions_text = "\n".join(additional_instructions) if additional_instructions else ""
     format_instructions_text = "\n".join(format_instructions) if format_instructions else ""
     
-    prompt = BATCH_PROMPT.format(
+    # Create context instructions based on whether we have a context image
+    image_context_instructions = ""
+    if context_image_data:
+        image_context_instructions = f"""
+I am also providing an additional image at the end (after all {len(images_data)} insect images) that contains reference information about insects.
+This final image is a document page that may help with your classification.
+Please examine all images, using the document image to inform your analysis of the insects.
+"""
+    
+    # Format the prompt
+    prompt = """
+    You are an expert entomologist specializing in insect identification. Your task is to analyze {count} 
+    images of insects and classify each one.
+    
+    For EACH image, categorize the insect into one of these categories:
+    {categories}
+    
+    {image_context_instructions}
+    
+    {additional_instructions}
+    
+    Format your response as follows, with a separate analysis for each image:
+    
+    IMAGE 1:
+    - Main Category: [the most likely category from the list]
+    - Confidence: [High, Medium, or Low]
+    - Description: [brief description of what you see]
+    {format_instructions}
+    
+    IMAGE 2:
+    - Main Category: [the most likely category from the list]
+    - Confidence: [High, Medium, or Low]
+    - Description: [brief description of what you see]
+    {format_instructions}
+    
+    And so on for each image...
+    
+    IMPORTANT: Provide a separate, clearly labeled analysis for each image using the format above.
+    """.format(
         count=len(images_data),
         categories=categories_list,
-        context_text=context_text,
+        image_context_instructions=image_context_instructions,
         additional_instructions=additional_instructions_text,
         format_instructions=format_instructions_text
     )
@@ -1693,7 +1679,7 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
             "content-type": "application/json"
         }
         
-        # Build content array with all images first
+        # Build content array with all insect images first
         content = []
         for img_data in images_data:
             content.append({
@@ -1702,6 +1688,17 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
                     "type": "base64",
                     "media_type": "image/jpeg",
                     "data": img_data
+                }
+            })
+        
+        # Add the context image AFTER all insect images if available
+        if context_image_data:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": context_image_data
                 }
             })
         
@@ -1808,8 +1805,8 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
             "count": len(image_results),
             "results": image_results,
             "context_source": context_source,
-            "context_paragraphs": retrieved_paragraphs,
             "top_sources": top_sources,
+            "context_image_used": context_image_data is not None,
             "raw_response": batch_text
         }
         
