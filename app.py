@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Insect categories for classification
@@ -75,7 +75,8 @@ image = (
         "rerankers",
         "rank-bm25",
         "nltk",
-        "sentence-transformers"
+        "sentence-transformers",
+        "colpali-engine"
     )
 )
 
@@ -1341,6 +1342,273 @@ def generate_flowbite_table_rows(results):
 
 # Generate classification using Claude's API for a single image
 # In app.py, modify the classify_image_claude function:
+
+# Add or modify this function in app.py
+@app.function(
+    image=image,
+    cpu=1.0,
+    timeout=600,  # Increased timeout
+    volumes={DATA_DIR: bee_volume}
+)
+def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
+    """
+    Classify insect in image using Claude's API with RAG context
+    
+    Args:
+        image_data: Base64 encoded image
+        options: Dictionary of toggle options
+    
+    Returns:
+        Dictionary with classification results
+    """
+    # IMPORTANT: Load RAG data at the start of this function
+    # This ensures the data is available in this function's container
+    load_rag_data()
+    
+    # Print diagnostics about loaded data
+    print_rag_diagnostics()
+    
+    result_id = uuid.uuid4().hex
+    
+    # Build additional instructions based on options
+    additional_instructions = []
+    format_instructions = []
+    
+    if options.get("detailed_description", False):
+        additional_instructions.append("Provide a detailed description of the insect, focusing on shapes and colors visible in the image.")
+        format_instructions.append("- Detailed Description: [shapes, colors, and distinctive features]")
+        
+    if options.get("plant_classification", False):
+        additional_instructions.append("If there are any plants visible in the image, identify them to the best of your ability.")
+        format_instructions.append("- Plant Identification: [names of visible plants, if any]")
+        
+    if options.get("taxonomy", False):
+        additional_instructions.append("Provide taxonomic classification of the insect to the most specific level possible (Order, Family, Genus, Species).")
+        format_instructions.append("- Taxonomy: [Order, Family, Genus, Species where possible]")
+    
+    # Get relevant context using visual similarity
+    context_source = None
+    context_image_data = None
+    top_sources = []
+    
+    # Check if RAG is available and enabled
+    rag_enabled = options.get("use_rag", True)
+    
+    # Verify RAG data is actually available
+    if rag_enabled:
+        global colpali_embeddings, df, page_images
+        rag_available = (colpali_embeddings is not None and 
+                         df is not None and len(df) > 0 and 
+                         page_images is not None and len(page_images) > 0)
+                         
+        if not rag_available:
+            logging.warning("RAG requested but data not available. Proceeding without context")
+    else:
+        rag_available = False
+        
+    if rag_enabled and rag_available:
+        try:
+            # Print debugging info
+            logging.info(f"RAG available: pages={len(page_images)}, embeddings={len(colpali_embeddings)}, df rows={len(df)}")
+            
+            # Get visually similar document pages
+            top_sources = retrieve_visually_similar_documents(image_data, top_k=3)
+            
+            if top_sources and len(top_sources) > 0:
+                source = top_sources[0]
+                context_source = f"{source.get('filename', 'unknown document')}, page {source.get('page', 'unknown')}"
+                logging.info(f"Using context source: {context_source}")
+                
+                # Get the context image
+                context_image_path = get_context_image_path([source])
+                if context_image_path and os.path.exists(context_image_path):
+                    # Convert context image to base64
+                    with open(context_image_path, "rb") as f:
+                        context_image_data = base64.b64encode(f.read()).decode('utf-8')
+                    logging.info(f"Found context image: {context_image_path}")
+                else:
+                    logging.warning(f"Could not find context image for {context_source}")
+            else:
+                logging.warning("No similar documents found")
+        except Exception as e:
+            logging.error(f"Error retrieving context: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Create context instructions based on whether we have a context image
+    image_context_instructions = ""
+    if context_image_data:
+        image_context_instructions = """
+I am also providing a SECOND IMAGE that contains reference information about insects.
+This second image is a document page that may help with your classification of the insect.
+Please examine both images, using the document image to inform your analysis of the insect.
+"""
+    
+    # Format the prompt - Make sure to clearly state this is for INSECT classification
+    prompt = """
+    You are an expert entomologist specializing in INSECT identification. Your task is to analyze the 
+    provided insect image and classify the insect(s) visible.
+    
+    Please categorize the insect into one of these categories:
+    {categories}
+    
+    {image_context_instructions}
+    
+    {additional_instructions}
+    
+    Format your response as follows:
+    - Main Category: [the most likely category from the list]
+    - Confidence: [High, Medium, or Low]
+    - Description: [brief description of what you see]
+    {format_instructions}
+    
+    IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
+    IMPORTANT: This is an INSECT image for classification, not a document.
+    """.format(
+        categories="\n".join([f"- {category}" for category in INSECT_CATEGORIES]),
+        image_context_instructions=image_context_instructions,
+        additional_instructions="\n".join(additional_instructions) if additional_instructions else "",
+        format_instructions="\n".join(format_instructions) if format_instructions else ""
+    )
+    
+    print("🔍 Sending insect image to Claude for classification...")
+    
+    try:
+        # Prepare the request for Claude API
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        # Build content array for the message
+        content = []
+        
+        # Add the input image
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": image_data
+            }
+        })
+        
+        # Add the context image if available
+        if context_image_data:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": context_image_data
+                }
+            })
+        
+        # Add the text prompt
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        payload = {
+            "model": "claude-3-7-sonnet-20250219",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ]
+        }
+        
+        # Log what's being sent to the API
+        logging.info(f"Sending request to Claude API with {len(content)} content items")
+        if context_image_data:
+            logging.info("Including context image in request")
+        
+        # Make the API call
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Extract the response content
+        result = response.json()
+        classification_text = result["content"][0]["text"]
+        
+        # Parse the classification result
+        # Simple parsing based on the expected format
+        lines = classification_text.strip().split("\n")
+        parsed_result = {}
+        
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip().replace("- ", "")
+                value = value.strip()
+                parsed_result[key] = value
+        
+        # Store essential information
+        category = parsed_result.get("Main Category", "Unclassified")
+        confidence = parsed_result.get("Confidence", "Low")
+        description = parsed_result.get("Description", "No description provided")
+        
+        # Check for missing fields in parsed result
+        if "Main Category" not in parsed_result:
+            logging.warning("Main Category not found in response, raw text: " + classification_text)
+        
+        # Store the full result in the database
+        try:
+            conn = setup_database(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Include context_source in the insert
+            cursor.execute(
+                "INSERT INTO results (id, category, confidence, description, additional_details, context_source) VALUES (?, ?, ?, ?, ?, ?)",
+                (result_id, category, confidence, description, json.dumps(parsed_result), context_source)
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "id": result_id,
+                "category": category,
+                "confidence": confidence,
+                "description": description,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available if rag_enabled else False,
+                "rag_enabled": rag_enabled,
+                "context_image_used": context_image_data is not None,
+                "raw_response": classification_text
+            }
+            
+        except Exception as db_error:
+            print(f"⚠️ Error saving to database: {db_error}")
+            # Still return the result even if database save fails
+            return {
+                "id": result_id,
+                "category": category,
+                "confidence": confidence,
+                "description": description,
+                "details": parsed_result,
+                "context_source": context_source,
+                "top_sources": top_sources,
+                "rag_available": rag_available if rag_enabled else False,  
+                "rag_enabled": rag_enabled,
+                "context_image_used": context_image_data is not None,
+                "raw_response": classification_text,
+                "db_error": str(db_error)
+            }
+            
+    except Exception as e:
+        print(f"⚠️ Error in classification: {e}")
+        return {
+            "error": str(e),
+            "id": result_id
+        }
+
 
 @app.function(
     image=image,
@@ -4108,12 +4376,8 @@ def serve():
             if not image_data:
                 return JSONResponse({"error": "No image data provided"}, status_code=400)
             
-            # CHANGE THIS LINE to match your actual function name
-            # If your function is named classify_document_claude:
-            result = classify_document_claude.remote(image_data, options)
-            
-            # Or if your function doesn't exist, uncomment this to create it with the expected name:
-            # result = classify_image_claude.remote(image_data, options)
+            # Make sure to use classify_image_claude here
+            result = classify_image_claude.remote(image_data, options)
             
             return JSONResponse(result)
                     
@@ -4122,6 +4386,38 @@ def serve():
             import traceback
             traceback.print_exc()
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # Function to print RAG diagnostics - add this for debugging
+    # Add this function to your app.py
+    def print_rag_diagnostics():
+        """Print diagnostic information about RAG components"""
+        global colpali_embeddings, df, page_images
+        
+        logging.info("=== RAG DIAGNOSTICS ===")
+        logging.info(f"colpali_embeddings: {'Available' if colpali_embeddings is not None else 'None'}")
+        if colpali_embeddings is not None:
+            logging.info(f"  Type: {type(colpali_embeddings)}")
+            logging.info(f"  Length: {len(colpali_embeddings)}")
+            if len(colpali_embeddings) > 0:
+                logging.info(f"  First item type: {type(colpali_embeddings[0])}")
+                if hasattr(colpali_embeddings[0], 'shape'):
+                    logging.info(f"  First item shape: {colpali_embeddings[0].shape}")
+        
+        logging.info(f"DataFrame: {'Available' if df is not None else 'None'}")
+        if df is not None:
+            logging.info(f"  Shape: {df.shape}")
+            logging.info(f"  Columns: {df.columns.tolist()}")
+            if len(df) > 0:
+                logging.info(f"  Sample row: {df.iloc[0].to_dict()}")
+        
+        logging.info(f"page_images: {'Available' if page_images is not None else 'None'}")
+        if page_images is not None:
+            logging.info(f"  Length: {len(page_images)}")
+            if len(page_images) > 0:
+                sample_keys = list(page_images.keys())[:3]
+                for key in sample_keys:
+                    path = page_images[key]
+                    logging.info(f"  {key}: {path} (Exists: {os.path.exists(path)})")
     
     #################################################
     # Batch Classify API Endpoint
