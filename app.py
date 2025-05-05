@@ -17,7 +17,6 @@ from PIL import Image
 from io import BytesIO
 from nltk.tokenize import word_tokenize
 import matplotlib.pyplot as plt
-from rerankers import Reranker
 import traceback
 
 from fasthtml.common import *
@@ -44,8 +43,17 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxx"
+CLAUDE_API_KEY = "sxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+
+# Global variables for RAG - DECLARE ALL GLOBALS HERE
+colpali_embeddings = None
+df = None
+page_images = {}
+bm25_index = None
+tokenized_docs = None
+colqwen2_model = None
+colqwen2_processor = None
 
 # Insect categories for classification
 INSECT_CATEGORIES = [
@@ -61,33 +69,7 @@ INSECT_CATEGORIES = [
     "Other flies"
 ]
 
-# Create custom image with all dependencies - FIXED for NumPy issue
-image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0", "libsm6", "libxrender1", "libxext6")
-    .pip_install(
-        "requests",
-        "python-fasthtml==0.12.0",
-        "numpy==2.2.4",  
-        "pandas",
-        "Pillow",
-        "matplotlib",
-        "rerankers",
-        "rank-bm25",
-        "nltk",
-        "sentence-transformers",
-        "colpali-engine"
-    )
-)
-
-# Look up data volume for storing results
-try:
-    bee_volume = modal.Volume.lookup("bee_volume", create_if_missing=True)
-except modal.exception.NotFoundError:
-    bee_volume = modal.Volume.persisted("bee_volume")
-
-# Base prompt template for Claude with context
-# Replace the existing CLASSIFICATION_PROMPT with this:
+# Classification prompts
 CLASSIFICATION_PROMPT = """
 You are an expert entomologist specializing in insect identification. Your task is to analyze the 
 provided insect image and classify the insect(s) visible.
@@ -108,7 +90,6 @@ Format your response as follows:
 IMPORTANT: Just provide the formatted response above with no additional explanation or apology.
 """
 
-# Batch prompt template for Claude with context
 BATCH_PROMPT = """
 You are an expert entomologist specializing in insect identification. Your task is to analyze {count} 
 images of insects and classify each one.
@@ -139,12 +120,30 @@ And so on for each image...
 IMPORTANT: Provide a separate, clearly labeled analysis for each image using the format above.
 """
 
-# Global variables for RAG
-colpali_embeddings = None
-df = None
-page_images = {}
-bm25_index = None
-tokenized_docs = None
+# Create custom image with all dependencies - FIXED for NumPy issue
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0", "libsm6", "libxrender1", "libxext6")
+    .pip_install(
+        "requests",
+        "python-fasthtml==0.12.0",
+        "numpy==2.2.4",  
+        "pandas",
+        "Pillow",
+        "matplotlib",
+        "rerankers",
+        "rank-bm25",
+        "nltk",
+        "sentence-transformers",
+        "colpali-engine"
+    )
+)
+
+# Look up data volume for storing results
+try:
+    bee_volume = modal.Volume.lookup("bee_volume", create_if_missing=True)
+except modal.exception.NotFoundError:
+    bee_volume = modal.Volume.persisted("bee_volume")
 
 # Setup database for classification results with feedback support
 def setup_database(db_path: str):
@@ -205,9 +204,8 @@ def save_results_file(result_id, result_content):
     except Exception as e:
         print(f"⚠️ Error saving result file: {e}")
         return False
-    
 
-    # Get classification statistics for dashboard
+# Get classification statistics for dashboard
 def get_classification_stats():
     """Query the database to get statistics about insect classifications"""
     try:
@@ -360,9 +358,39 @@ def get_classification_stats():
             "total_batch": 0,
             "total": 0
         }
-    
 
-# Add this function to app.py
+# Print RAG diagnostics for debugging
+def print_rag_diagnostics():
+    """Print diagnostic information about RAG components"""
+    global colpali_embeddings, df, page_images
+    
+    logging.info("=== RAG DIAGNOSTICS ===")
+    logging.info(f"colpali_embeddings: {'Available' if colpali_embeddings is not None else 'None'}")
+    if colpali_embeddings is not None:
+        logging.info(f"  Type: {type(colpali_embeddings)}")
+        logging.info(f"  Length: {len(colpali_embeddings)}")
+        if len(colpali_embeddings) > 0:
+            logging.info(f"  First item type: {type(colpali_embeddings[0])}")
+            if hasattr(colpali_embeddings[0], 'shape'):
+                logging.info(f"  First item shape: {colpali_embeddings[0].shape}")
+    
+    logging.info(f"DataFrame: {'Available' if df is not None else 'None'}")
+    if df is not None:
+        logging.info(f"  Shape: {df.shape}")
+        logging.info(f"  Columns: {df.columns.tolist()}")
+        if len(df) > 0:
+            logging.info(f"  Sample row: {df.iloc[0].to_dict()}")
+    
+    logging.info(f"page_images: {'Available' if page_images is not None else 'None'}")
+    if page_images is not None:
+        logging.info(f"  Length: {len(page_images)}")
+        if len(page_images) > 0:
+            sample_keys = list(page_images.keys())[:3]
+            for key in sample_keys:
+                path = page_images[key]
+                logging.info(f"  {key}: {path} (Exists: {os.path.exists(path)})")
+
+# Initialize from image directory
 def initialize_from_image_directory():
     """Initialize RAG data directly from existing images in PDF_IMAGES_DIR"""
     global colpali_embeddings, df, page_images
@@ -518,7 +546,7 @@ def initialize_from_image_directory():
         traceback.print_exc()
         return False
 
-# Modify load_rag_data to call initialize_from_image_directory if needed
+# Load RAG data
 def load_rag_data():
     """Load all data needed for document retrieval with fallback to image directory initialization"""
     global colpali_embeddings, df, page_images, bm25_index, tokenized_docs
@@ -656,7 +684,7 @@ def load_rag_data():
     logging.info(f"Page Images: {'✅ Available' if page_images and len(page_images) > 0 else '❌ Missing'}")
     logging.info(f"ColPali Embeddings: {'✅ Available' if colpali_embeddings is not None else '❌ Missing'}")
 
-
+# Retrieve visually similar documents
 def retrieve_visually_similar_documents(query_image_data: str, top_k=3):
     """Retrieve visually similar document pages using the ColQwen2 embeddings"""
     global colpali_embeddings, df, page_images
@@ -710,8 +738,11 @@ def retrieve_visually_similar_documents(query_image_data: str, top_k=3):
         traceback.print_exc()
         return []
 
+# Generate image embedding
 def generate_image_embedding(image):
     """Generate an embedding for an image using the ColQwen2 model"""
+    global colqwen2_model, colqwen2_processor
+    
     try:
         # Import necessary components
         from colpali_engine.models import ColQwen2, ColQwen2Processor
@@ -720,7 +751,6 @@ def generate_image_embedding(image):
         model_name = "vidore/colqwen2-v1.0"
         
         # Load model if not already loaded
-        global colqwen2_model, colqwen2_processor
         if 'colqwen2_model' not in globals() or colqwen2_model is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             colqwen2_model = ColQwen2.from_pretrained(
@@ -743,6 +773,7 @@ def generate_image_embedding(image):
         logging.error(f"Error generating image embedding: {e}")
         return None
 
+# Calculate visual similarity
 def calculate_visual_similarity(query_embedding, doc_embedding):
     """Calculate visual similarity between two embeddings"""
     try:
@@ -881,9 +912,6 @@ async def retrieve_relevant_documents(query, top_k=5):
         traceback.print_exc()
         return [], []
 
-
-
-
 # Format image for API calls
 def format_image(image):
     """Convert PIL Image to base64 for API"""
@@ -966,57 +994,6 @@ def get_context_image(top_sources):
             except Exception as e:
                 logging.error(f"Error opening image {path}: {e}")
     
-    # If path wasn't in our list, try listing directory contents to find matching files
-    if filename:
-        base_filename = os.path.splitext(filename)[0]
-        dir_path = os.path.join(PDF_IMAGES_DIR, base_filename)
-        
-        if os.path.exists(dir_path) and os.path.isdir(dir_path):
-            try:
-                files = os.listdir(dir_path)
-                logging.info(f"Found {len(files)} files in {dir_path}: {files[:10]}")
-                
-                # Look for files that might match the page number
-                page_files = [f for f in files if f.startswith(str(page_num)) or f.endswith(f"{page_num}.png")]
-                if page_files:
-                    path = os.path.join(dir_path, page_files[0])
-                    try:
-                        context_image = Image.open(path)
-                        logging.info(f"Found matching page file: {path}")
-                        return context_image
-                    except Exception as e:
-                        logging.error(f"Error opening image {path}: {e}")
-            except Exception as e:
-                logging.error(f"Error listing directory {dir_path}: {e}")
-    
-    # Check the PDF_IMAGES_DIR root for any matching files
-    try:
-        if os.path.exists(PDF_IMAGES_DIR) and os.path.isdir(PDF_IMAGES_DIR):
-            directories = [d for d in os.listdir(PDF_IMAGES_DIR) 
-                          if os.path.isdir(os.path.join(PDF_IMAGES_DIR, d))]
-            logging.info(f"Available directories in {PDF_IMAGES_DIR}: {directories}")
-            
-            # If filename matches or is similar to any directory, check inside
-            if filename:
-                base_filename = os.path.splitext(filename)[0]
-                for dir_name in directories:
-                    if base_filename.lower() in dir_name.lower() or dir_name.lower() in base_filename.lower():
-                        dir_path = os.path.join(PDF_IMAGES_DIR, dir_name)
-                        files = os.listdir(dir_path)
-                        
-                        # Look for the page number
-                        for file in files:
-                            if file.startswith(str(page_num)) or f"_{page_num}." in file or f"_{page_num}_" in file:
-                                path = os.path.join(dir_path, file)
-                                try:
-                                    context_image = Image.open(path)
-                                    logging.info(f"Found matching file in similar directory: {path}")
-                                    return context_image
-                                except Exception as e:
-                                    logging.error(f"Error opening image {path}: {e}")
-    except Exception as e:
-        logging.error(f"Error searching PDF_IMAGES_DIR: {e}")
-    
     logging.warning(f"Could not find context image for {filename} page {page_num}")
     return None
 
@@ -1053,7 +1030,6 @@ def get_context_image_path(top_sources):
         return None
     
     return page_images[image_key] if image_key in page_images else None
-
 
 # Get template path based on environment
 def get_template_path(filename):
@@ -1202,50 +1178,6 @@ def get_trend_indicator(stats):
         "html": html
     }
 
-
-def dashboard():
-    """Render the enhanced insect classification dashboard with Flowbite components and HTMX"""
-    stats = get_classification_stats()
-    
-    # Create navigation bar
-    navbar = Div(
-        Div(
-            A(
-                Span("🐝", cls="text-xl"),
-                Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
-                href="/",
-                cls="flex items-center"
-            ),
-            Div(
-                A(
-                    "Dashboard",
-                    href="/dashboard",
-                    cls="btn btn-sm btn-ghost btn-active"
-                ),
-                A(
-                    "Classifier",
-                    href="/",
-                    cls="btn btn-sm btn-ghost"
-                ),
-                cls="flex-none"
-            ),
-            cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
-        ),
-        cls="w-full"
-    )
-    
-    # Line chart section
-    trend_data = get_trend_indicator(stats)
-    
-    # Here's the fix - use NotStr instead of Raw
-    Div(
-        P(
-            NotStr(trend_data["html"]),  # This line is fixed
-            cls="text-xl font-bold",
-            id="trend-indicator"
-        )
-    )
-
 def generate_flowbite_table_rows(results):
     """Generate HTML for Flowbite table rows"""
     if not results:
@@ -1341,9 +1273,6 @@ def generate_flowbite_table_rows(results):
     return html
 
 # Generate classification using Claude's API for a single image
-# In app.py, modify the classify_image_claude function:
-
-# Add or modify this function in app.py
 @app.function(
     image=image,
     cpu=1.0,
@@ -1363,6 +1292,8 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
     """
     # IMPORTANT: Load RAG data at the start of this function
     # This ensures the data is available in this function's container
+    global colpali_embeddings, df, page_images
+    
     load_rag_data()
     
     # Print diagnostics about loaded data
@@ -1396,7 +1327,6 @@ def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str
     
     # Verify RAG data is actually available
     if rag_enabled:
-        global colpali_embeddings, df, page_images
         rag_available = (colpali_embeddings is not None and 
                          df is not None and len(df) > 0 and 
                          page_images is not None and len(page_images) > 0)
@@ -1627,6 +1557,8 @@ async def classify_document_claude(image_data: str, options: Dict[str, bool]) ->
     Returns:
         Dictionary with classification and analysis results
     """
+    global colpali_embeddings, df, page_images
+    
     result_id = uuid.uuid4().hex
     
     # Build additional instructions based on options
@@ -1861,6 +1793,8 @@ def classify_batch_claude(images_data: List[str], options: Dict[str, bool]) -> D
     Returns:
         Dictionary with batch classification results
     """
+    global colpali_embeddings, df, page_images
+    
     batch_id = uuid.uuid4().hex
     
     # Limit to max 5 images per batch for cost/performance
@@ -2307,8 +2241,406 @@ def serve():
     setup_database(DB_PATH)
     
     #################################################
-    # Dashboard Route - Enhanced with Flowbite and HTMX
+    # API routes and page handlers go here
     #################################################
+    @rt("/api/classify", methods=["POST"])
+    async def api_classify_image(request):
+        """API endpoint to classify insect image using Claude with RAG"""
+        try:
+            # Get image data and options from request JSON
+            data = await request.json()
+            image_data = data.get("image_data", "")
+            options = data.get("options", {})
+            
+            if not image_data:
+                return JSONResponse({"error": "No image data provided"}, status_code=400)
+            
+            # Make sure to use classify_image_claude here
+            result = classify_image_claude.remote(image_data, options)
+            
+            return JSONResponse(result)
+                    
+        except Exception as e:
+            print(f"Error classifying image: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @rt("/analyze-document", methods=["POST"])
+    async def api_analyze_document(request):
+        """API endpoint to analyze document as a pure image using Claude's Vision API"""
+        try:
+            # Get image data and options from request JSON
+            data = await request.json()
+            image_data = data.get("image_data", "")
+            options = data.get("options", {})
+            
+            if not image_data:
+                return JSONResponse({"error": "No document image data provided"}, status_code=400)
+            
+            # Add document-specific options if not present
+            if "detailed_analysis" not in options:
+                options["detailed_analysis"] = True
+            if "extract_key_points" not in options:
+                options["extract_key_points"] = True
+            if "identify_document_type" not in options:
+                options["identify_document_type"] = True
+            
+            # Call the document classification function
+            result = classify_document_claude.remote(image_data, options)
+            
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error analyzing document: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @rt("/classify-batch", methods=["POST"])
+    async def api_classify_batch(request):
+        """API endpoint to classify multiple insect images in batch mode with RAG"""
+        try:
+            # Get form data with files
+            form = await request.form()
+            options_json = form.get("options", "{}")
+            options = json.loads(options_json)
+            
+            # Extract image files
+            image_files = []
+            for key in form.keys():
+                if key.startswith("image_"):
+                    image_files.append(form.get(key))
+                    
+            if not image_files:
+                return JSONResponse({"error": "No images provided"}, status_code=400)
+                
+            # Limit to 5 images
+            if len(image_files) > 5:
+                image_files = image_files[:5]
+                
+            # Process each image
+            base64_images = []
+            for file in image_files:
+                # Read file content
+                content = await file.read()
+                
+                # Convert to base64
+                base64_data = base64.b64encode(content).decode("utf-8")
+                base64_images.append(base64_data)
+                
+            if not base64_images:
+                return JSONResponse({"error": "Failed to process images"}, status_code=400)
+                
+            result = classify_batch_claude.remote(base64_images, options)
+            
+            # Return the result
+            return JSONResponse(result)
+                
+        except Exception as e:
+            print(f"Error in batch classification: {e}")
+            import traceback
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # Additional API routes for feedback, charts, etc.
+    @rt("/api/feedback", methods=["POST"])
+    async def api_submit_feedback(request):
+        """API endpoint to submit feedback for a classification"""
+        try:
+            # Get form data
+            form_data = await request.form()
+            result_id = form_data.get("id")
+            feedback = form_data.get("feedback")
+            
+            if not result_id or not feedback:
+                return HTMLResponse("""
+                <div class="text-error">Error: Missing parameters</div>
+                """, status_code=400)
+            
+            # Validate feedback type
+            if feedback not in ["positive", "negative"]:
+                return HTMLResponse("""
+                <div class="text-error">Error: Invalid feedback type</div>
+                """, status_code=400)
+            
+            # Update the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Update the record
+            cursor.execute(
+                "UPDATE results SET feedback = ? WHERE id = ?",
+                (feedback, result_id)
+            )
+            
+            # Check if any row was affected
+            if cursor.rowcount == 0:
+                # Try batch results table
+                cursor.execute(
+                    "SELECT batch_id, results FROM batch_results WHERE batch_id = ? OR batch_id = SUBSTR(?, 1, INSTR(?, '_') - 1)",
+                    (result_id, result_id, result_id)
+                )
+                batch_result = cursor.fetchone()
+                
+                if batch_result:
+                    batch_id, results_json = batch_result
+                    
+                    # Parse the results JSON
+                    results_data = json.loads(results_json)
+                    
+                    # Find the specific result in the batch
+                    for result in results_data:
+                        if result.get("id") == result_id:
+                            # Update the feedback
+                            result["feedback"] = feedback
+                            break
+                    
+                    # Save the updated results back to the database
+                    cursor.execute(
+                        "UPDATE batch_results SET results = ? WHERE batch_id = ?",
+                        (json.dumps(results_data), batch_id)
+                    )
+            
+            conn.commit()
+            conn.close()
+            
+            # Return updated feedback pill/badge
+            feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+            return HTMLResponse(f"""
+            <span class="badge {feedback_class}">{feedback}</span>
+            """)
+            
+        except Exception as e:
+            print(f"Error submitting feedback: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <div class="text-error">Error: {str(e)}</div>
+            """, status_code=500)
+            
+    @rt("/api/chart-data", methods=["GET"])
+    async def api_chart_data(request):
+        """API endpoint to get chart data for the donut chart"""
+        try:
+            # Get stats
+            stats = get_classification_stats()
+            
+            # Process the top categories
+            categories_to_display = stats["combined_category_counts"][:10]
+            
+            # Format the data for ApexCharts
+            labels = [category for category, _ in categories_to_display]
+            counts = [count for _, count in categories_to_display]
+            
+            # Return JSON data
+            return JSONResponse({
+                "labels": labels,
+                "counts": counts
+            })
+            
+        except Exception as e:
+            print(f"Error getting chart data: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    @rt("/api/recent-classifications", methods=["GET"])
+    async def api_recent_classifications(request):
+        """API endpoint to get recent classification data for the table"""
+        try:
+            # Get limit parameter with default of 10
+            limit = int(request.query_params.get("limit", 10))
+            
+            # Connect to the database
+            conn = sqlite3.connect(DB_PATH, timeout=30.0)
+            cursor = conn.cursor()
+            
+            # Get recent classifications
+            cursor.execute("""
+                SELECT id, category, confidence, feedback, created_at, context_source 
+                FROM results 
+                ORDER BY created_at DESC 
+                LIMIT ?
+            """, (limit,))
+            
+            recent_classifications = cursor.fetchall()
+            conn.close()
+            
+            # Generate HTML for the table body
+            html = ""
+            for id, category, confidence, feedback, created_at, context_source in recent_classifications:
+                # Determine confidence class
+                confidence_class = 'badge-warning'
+                if confidence == 'High':
+                    confidence_class = 'badge-success'
+                elif confidence == 'Low':
+                    confidence_class = 'badge-error'
+                
+                # Build the table row
+                html += f"""
+                <tr class="hover">
+                    <td>
+                        <div class="avatar cursor-pointer" onclick="document.getElementById('modal-{id[:8]}').showModal()">
+                            <div class="mask mask-squircle w-12 h-12 bg-base-300 flex items-center justify-center">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-base-content/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                </svg>
+                            </div>
+                        </div>
+                        
+                        <dialog id="modal-{id[:8]}" class="modal">
+                            <div class="modal-box">
+                                <h3 class="font-bold text-lg mb-2">Classification: {category}</h3>
+                                <!-- Modal content -->
+                                <div class="modal-action">
+                                    <form method="dialog">
+                                        <button class="btn">Close</button>
+                                    </form>
+                                </div>
+                            </div>
+                            <form method="dialog" class="modal-backdrop">
+                                <button>close</button>
+                            </form>
+                        </dialog>
+                    </td>
+                    <td class="font-mono text-xs">{id[:8]}...</td>
+                    <td>{category}</td>
+                    <td>
+                        <span class="badge {confidence_class}">{confidence}</span>
+                    </td>
+                """
+                
+                # Feedback cell
+                if feedback:
+                    feedback_class = "badge-success" if feedback == "positive" else "badge-error"
+                    html += f"""
+                    <td>
+                        <span class="badge {feedback_class}">{feedback}</span>
+                    </td>
+                    """
+                else:
+                    html += f"""
+                    <td>
+                        <div class="flex space-x-1">
+                            <button 
+                                class="btn btn-xs btn-circle btn-outline" 
+                                hx-post="/api/feedback"
+                                hx-vals='{{"id": "{id}", "feedback": "positive"}}'
+                                hx-swap="outerHTML"
+                                title="Positive Feedback">
+                                👍
+                            </button>
+                            <button 
+                                class="btn btn-xs btn-circle btn-outline" 
+                                hx-post="/api/feedback"
+                                hx-vals='{{"id": "{id}", "feedback": "negative"}}'
+                                hx-swap="outerHTML"
+                                title="Negative Feedback">
+                                👎
+                            </button>
+                        </div>
+                    </td>
+                    """
+                
+                # Context source and time
+                source_display = context_source if context_source else "None"
+                html += f"""
+                    <td class="max-w-xs truncate" title="{source_display}">{source_display}</td>
+                    <td>{created_at}</td>
+                    <td>
+                        <div class="dropdown dropdown-end">
+                            <label tabindex="0" class="btn btn-xs btn-ghost m-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z" />
+                                </svg>
+                            </label>
+                            <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+                                <li><a onclick="document.getElementById('modal-{id[:8]}').showModal()">View Details</a></li>
+                                <li><a hx-get="/export-result?id={id}" hx-trigger="click" hx-swap="none">Export Result</a></li>
+                            </ul>
+                        </div>
+                    </td>
+                </tr>
+                """
+            
+            # Return the HTML directly for HTMX to swap
+            return HTMLResponse(html)
+            
+        except Exception as e:
+            print(f"Error getting recent classifications: {e}")
+            traceback.print_exc()
+            return HTMLResponse(f"""
+            <tr>
+                <td colspan="8" class="text-center text-error">
+                    Error loading data: {str(e)}
+                </td>
+            </tr>
+            """)
+    
+    @rt("/image-thumbnail", methods=["GET"])
+    async def serve_image_thumbnail(request):
+        """Serve a thumbnail image for classifications"""
+        try:
+            # Get the image path from query parameters
+            image_path = request.query_params.get("path", "")
+            
+            if not image_path or not os.path.exists(image_path):
+                # Return a placeholder SVG if no image is found
+                placeholder_svg = """
+                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                    <polyline points="21 15 16 10 5 21"></polyline>
+                </svg>
+                """
+                return Response(
+                    content=placeholder_svg.encode("utf-8"),
+                    media_type="image/svg+xml"
+                )
+            
+            # Get the file extension to determine content type
+            _, ext = os.path.splitext(image_path.lower())
+            
+            # Set content type based on extension
+            if ext in ['.jpg', '.jpeg']:
+                content_type = "image/jpeg"
+            elif ext == '.png':
+                content_type = "image/png"
+            elif ext == '.gif':
+                content_type = "image/gif"
+            elif ext == '.svg':
+                content_type = "image/svg+xml"
+            else:
+                content_type = "application/octet-stream"
+            
+            # Read the file
+            with open(image_path, "rb") as f:
+                content = f.read()
+            
+            # Return the image
+            return Response(
+                content=content,
+                media_type=content_type
+            )
+            
+        except Exception as e:
+            print(f"Error serving image: {e}")
+            traceback.print_exc()
+            
+            # Return a placeholder SVG if there's an error
+            placeholder_svg = """
+            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="12" y1="8" x2="12" y2="12"></line>
+                <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            """
+            return Response(
+                content=placeholder_svg.encode("utf-8"),
+                media_type="image/svg+xml"
+            )
+    
+    # Include homepage and dashboard routes
     @rt("/dashboard")
     def dashboard():
         """Render the enhanced insect classification dashboard with Flowbite components and HTMX"""
@@ -3098,182 +3430,181 @@ def serve():
                     
                     cls="w-full text-sm text-left text-gray-500 dark:text-gray-400 flowbite-table"
                 ),
-                
                 # Pagination with HTMX
-                    Nav(
-                        Span(
-                            "Showing ",
-                            Span("1-10", cls="font-semibold text-gray-900 dark:text-white"),
-                            " of ",
-                            Span(str(stats["total_single"]), cls="font-semibold text-gray-900 dark:text-white"),
-                            cls="text-sm font-normal text-gray-500 dark:text-gray-400"
-                        ),
-                        Ul(
-                            Li(
-                                A(
-                                    "Previous",
-                                    href="#",
-                                    cls="flex items-center justify-center px-3 h-8 ml-0 leading-tight text-gray-500 bg-white border border-gray-300 rounded-l-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
-                                    hx_get="/api/classifications-page?page=prev",
-                                    hx_target="#flowbite-table-body"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "1",
-                                    href="#",
-                                    cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
-                                    hx_get="/api/classifications-page?page=1",
-                                    hx_target="#flowbite-table-body"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "2",
-                                    href="#",
-                                    cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
-                                    hx_get="/api/classifications-page?page=2",
-                                    hx_target="#flowbite-table-body"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "3",
-                                    aria_current="page",
-                                    href="#",
-                                    cls="flex items-center justify-center px-3 h-8 text-blue-600 border border-gray-300 bg-blue-50 hover:bg-blue-100 hover:text-blue-700 dark:border-gray-700 dark:bg-gray-700 dark:text-white",
-                                    hx_get="/api/classifications-page?page=3",
-                                    hx_target="#flowbite-table-body"
-                                )
-                            ),
-                            Li(
-                                A(
-                                    "Next",
-                                    href="#",
-                                    cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 rounded-r-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
-                                    hx_get="/api/classifications-page?page=next",
-                                    hx_target="#flowbite-table-body"
-                                )
-                            ),
-                            cls="inline-flex -space-x-px text-sm h-8"
-                        ),
-                        cls="flex items-center justify-between p-4",
-                        aria_label="Table navigation"
+                Nav(
+                    Span(
+                        "Showing ",
+                        Span("1-10", cls="font-semibold text-gray-900 dark:text-white"),
+                        " of ",
+                        Span(str(stats["total_single"]), cls="font-semibold text-gray-900 dark:text-white"),
+                        cls="text-sm font-normal text-gray-500 dark:text-gray-400"
                     ),
-                    
-                    cls="relative overflow-x-auto shadow-md sm:rounded-lg"
+                    Ul(
+                        Li(
+                            A(
+                                "Previous",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 ml-0 leading-tight text-gray-500 bg-white border border-gray-300 rounded-l-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=prev",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "1",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=1",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "2",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=2",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "3",
+                                aria_current="page",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 text-blue-600 border border-gray-300 bg-blue-50 hover:bg-blue-100 hover:text-blue-700 dark:border-gray-700 dark:bg-gray-700 dark:text-white",
+                                hx_get="/api/classifications-page?page=3",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        Li(
+                            A(
+                                "Next",
+                                href="#",
+                                cls="flex items-center justify-center px-3 h-8 leading-tight text-gray-500 bg-white border border-gray-300 rounded-r-lg hover:bg-gray-100 hover:text-gray-700 dark:bg-gray-800 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-white",
+                                hx_get="/api/classifications-page?page=next",
+                                hx_target="#flowbite-table-body"
+                            )
+                        ),
+                        cls="inline-flex -space-x-px text-sm h-8"
+                    ),
+                    cls="flex items-center justify-between p-4",
+                    aria_label="Table navigation"
                 ),
                 
-                # Image Modal for Detail View
+                cls="relative overflow-x-auto shadow-md sm:rounded-lg"
+            ),
+            
+            # Image Modal for Detail View
+            Div(
                 Div(
                     Div(
+                        H3("Classification Details", cls="text-lg leading-6 font-medium text-gray-900", id="modal-title"),
                         Div(
-                            H3("Classification Details", cls="text-lg leading-6 font-medium text-gray-900", id="modal-title"),
                             Div(
-                                Div(
-                                    # Placeholder image
-                                    Svg(
-                                        Path(
-                                            stroke_linecap="round",
-                                            stroke_linejoin="round",
-                                            stroke_width="2",
-                                            d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
-                                        ),
-                                        id="modal-image-placeholder",
-                                        cls="h-48 w-48 text-gray-400",
-                                        fill="none",
-                                        viewBox="0 0 24 24",
-                                        stroke="currentColor"
+                                # Placeholder image
+                                Svg(
+                                    Path(
+                                        stroke_linecap="round",
+                                        stroke_linejoin="round",
+                                        stroke_width="2",
+                                        d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
                                     ),
-                                    Img(
-                                        id="modal-image",
-                                        cls="max-h-64 hidden",
-                                        src="",
-                                        alt="Classification Image"
-                                    ),
-                                    cls="bg-gray-100 p-4 rounded-lg flex items-center justify-center"
+                                    id="modal-image-placeholder",
+                                    cls="h-48 w-48 text-gray-400",
+                                    fill="none",
+                                    viewBox="0 0 24 24",
+                                    stroke="currentColor"
                                 ),
-                                Div(
-                                    P(
-                                        Span("ID:", cls="font-semibold"),
-                                        Span(id="modal-id")
-                                    ),
-                                    P(
-                                        Span("Category:", cls="font-semibold"),
-                                        Span(id="modal-category")
-                                    ),
-                                    P(
-                                        Span("Confidence:", cls="font-semibold"),
-                                        Span(id="modal-confidence")
-                                    ),
-                                    P(
-                                        Span("Reference Source:", cls="font-semibold"),
-                                        Span(id="modal-source"),
-                                        id="modal-source-container",
-                                        cls="hidden"
-                                    ),
-                                    P(
-                                        Span("Description:", cls="font-semibold"),
-                                        Span(id="modal-description"),
-                                        id="modal-description-container",
-                                        cls="hidden"
-                                    ),
-                                    cls="mt-4 text-left"
+                                Img(
+                                    id="modal-image",
+                                    cls="max-h-64 hidden",
+                                    src="",
+                                    alt="Classification Image"
                                 ),
-                                cls="mt-2 px-7 py-3"
+                                cls="bg-gray-100 p-4 rounded-lg flex items-center justify-center"
                             ),
                             Div(
-                                Button(
-                                    "Close",
-                                    id="modal-close",
-                                    cls="px-4 py-2 bg-gray-500 text-white text-base font-medium rounded-md w-full shadow-sm hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300"
+                                P(
+                                    Span("ID:", cls="font-semibold"),
+                                    Span(id="modal-id")
                                 ),
-                                cls="items-center px-4 py-3"
+                                P(
+                                    Span("Category:", cls="font-semibold"),
+                                    Span(id="modal-category")
+                                ),
+                                P(
+                                    Span("Confidence:", cls="font-semibold"),
+                                    Span(id="modal-confidence")
+                                ),
+                                P(
+                                    Span("Reference Source:", cls="font-semibold"),
+                                    Span(id="modal-source"),
+                                    id="modal-source-container",
+                                    cls="hidden"
+                                ),
+                                P(
+                                    Span("Description:", cls="font-semibold"),
+                                    Span(id="modal-description"),
+                                    id="modal-description-container",
+                                    cls="hidden"
+                                ),
+                                cls="mt-4 text-left"
                             ),
-                            cls="mt-3 text-center"
+                            cls="mt-2 px-7 py-3"
                         ),
-                        cls="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white"
+                        Div(
+                            Button(
+                                "Close",
+                                id="modal-close",
+                                cls="px-4 py-2 bg-gray-500 text-white text-base font-medium rounded-md w-full shadow-sm hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-300"
+                            ),
+                            cls="items-center px-4 py-3"
+                        ),
+                        cls="mt-3 text-center"
                     ),
-                    id="image-modal",
-                    cls="fixed hidden inset-0 bg-black bg-opacity-50 overflow-y-auto h-full w-full z-50"
+                    cls="relative top-20 mx-auto p-5 border w-11/12 md:w-3/4 lg:w-1/2 shadow-lg rounded-md bg-white"
                 ),
+                id="image-modal",
+                cls="fixed hidden inset-0 bg-black bg-opacity-50 overflow-y-auto h-full w-full z-50"
+            ),
+            
+            # Modal handling script
+            Script("""
+            // Modal handling functions
+            function showImageModal(id, category, confidence) {
+                // Set modal content
+                document.getElementById('modal-id').textContent = id;
+                document.getElementById('modal-category').textContent = category;
                 
-                # Modal handling script
-                Script("""
-                // Modal handling functions
-                function showImageModal(id, category, confidence) {
-                    // Set modal content
-                    document.getElementById('modal-id').textContent = id;
-                    document.getElementById('modal-category').textContent = category;
-                    
-                    // Set confidence with appropriate color
-                    const confidenceEl = document.getElementById('modal-confidence');
-                    confidenceEl.textContent = confidence;
-                    confidenceEl.className = confidence === 'High' ? 'text-green-600' : 
-                                            confidence === 'Medium' ? 'text-yellow-600' : 'text-red-600';
-                    
-                    // Show modal
-                    document.getElementById('image-modal').classList.remove('hidden');
-                    
-                    // Optional: Fetch additional details with HTMX
-                    htmx.ajax('GET', '/api/classification-details/' + id, {target: '#modal-description-container'});
+                // Set confidence with appropriate color
+                const confidenceEl = document.getElementById('modal-confidence');
+                confidenceEl.textContent = confidence;
+                confidenceEl.className = confidence === 'High' ? 'text-green-600' : 
+                                        confidence === 'Medium' ? 'text-yellow-600' : 'text-red-600';
+                
+                // Show modal
+                document.getElementById('image-modal').classList.remove('hidden');
+                
+                // Optional: Fetch additional details with HTMX
+                htmx.ajax('GET', '/api/classification-details/' + id, {target: '#modal-description-container'});
+            }
+            
+            // Close modal when close button is clicked
+            document.getElementById('modal-close').addEventListener('click', function() {
+                document.getElementById('image-modal').classList.add('hidden');
+            });
+            
+            // Close modal when backdrop is clicked
+            document.getElementById('image-modal').addEventListener('click', function(e) {
+                if (e.target === this) {
+                    this.classList.add('hidden');
                 }
-                
-                // Close modal when close button is clicked
-                document.getElementById('modal-close').addEventListener('click', function() {
-                    document.getElementById('image-modal').classList.add('hidden');
-                });
-                
-                // Close modal when backdrop is clicked
-                document.getElementById('image-modal').addEventListener('click', function(e) {
-                    if (e.target === this) {
-                        this.classList.add('hidden');
-                    }
-                });
-                """),
-                
-                cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
-            )
+            });
+            """),
+            
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
+        )
         
         # Tables Section with Tab Navigation
         tables_section = Div(
@@ -3393,7 +3724,7 @@ def serve():
                 navbar,
                 summary_cards,
                 charts_section,
-                map_section,  # Add the map section here
+                map_section,
                 confidence_feedback_section,
                 tables_section,
                 rag_section,
@@ -3402,1077 +3733,8 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-
-
-    #################################################
-    # API route for document analysis - treating documents as pure images
-    #################################################
-    @rt("/analyze-document", methods=["POST"])
-    async def api_analyze_document(request):
-        """API endpoint to analyze document as a pure image using Claude's Vision API"""
-        try:
-            # Get image data and options from request JSON
-            data = await request.json()
-            image_data = data.get("image_data", "")
-            options = data.get("options", {})
-            
-            if not image_data:
-                return JSONResponse({"error": "No document image data provided"}, status_code=400)
-            
-            # Add document-specific options if not present
-            if "detailed_analysis" not in options:
-                options["detailed_analysis"] = True
-            if "extract_key_points" not in options:
-                options["extract_key_points"] = True
-            if "identify_document_type" not in options:
-                options["identify_document_type"] = True
-            
-            # Call the document classification function
-            result = classify_document_claude.remote(image_data, options)
-            
-            return JSONResponse(result)
-                
-        except Exception as e:
-            print(f"Error analyzing document: {e}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-    #################################################
-    # API route for batch document analysis
-    #################################################
-    @rt("/analyze-documents-batch", methods=["POST"])
-    async def api_analyze_documents_batch(request):
-        """API endpoint to analyze multiple documents as images in batch mode"""
-        try:
-            # Get form data with files
-            form = await request.form()
-            options_json = form.get("options", "{}")
-            options = json.loads(options_json)
-            
-            # Extract document files
-            document_files = []
-            for key in form.keys():
-                if key.startswith("document_"):
-                    document_files.append(form.get(key))
-                        
-            if not document_files:
-                return JSONResponse({"error": "No documents provided"}, status_code=400)
-                    
-            # Limit to 5 documents per batch
-            if len(document_files) > 5:
-                document_files = document_files[:5]
-                    
-            # Process each document
-            base64_images = []
-            for file in document_files:
-                # Read file content
-                content = await file.read()
-                    
-                # Convert to base64
-                base64_data = base64.b64encode(content).decode("utf-8")
-                base64_images.append(base64_data)
-                    
-            if not base64_images:
-                return JSONResponse({"error": "Failed to process documents"}, status_code=400)
-            
-            # Add document-specific options if not present
-            if "detailed_analysis" not in options:
-                options["detailed_analysis"] = True
-            if "extract_key_points" not in options:
-                options["extract_key_points"] = True
-            if "identify_document_type" not in options:
-                options["identify_document_type"] = True
-                    
-            # Call batch analysis function - you'll need to implement this separately
-            # For now, we'll just call the single document function for each document
-            results = []
-            for image_data in base64_images:
-                result = classify_document_claude.remote(image_data, options)
-                results.append(result)
-                
-            # Return the batch results
-            return JSONResponse({
-                "batch_id": uuid.uuid4().hex,
-                "count": len(results),
-                "results": results
-            })
-                    
-        except Exception as e:
-            print(f"Error in batch document analysis: {e}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-#################################################
-    # API route for chart data
-    #################################################
-    @rt("/api/chart-data", methods=["GET"])
-    async def api_chart_data(request):
-        """API endpoint to get chart data for the donut chart"""
-        try:
-            # Get stats
-            stats = get_classification_stats()
-            
-            # Process the top categories
-            categories_to_display = stats["combined_category_counts"][:10]
-            
-            # Format the data for ApexCharts
-            labels = [category for category, _ in categories_to_display]
-            counts = [count for _, count in categories_to_display]
-            
-            # Return JSON data
-            return JSONResponse({
-                "labels": labels,
-                "counts": counts
-            })
-            
-        except Exception as e:
-            print(f"Error getting chart data: {e}")
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-    #################################################
-    # API route for activity chart data
-    #################################################
-    @rt("/api/chart-activity", methods=["GET"])
-    async def api_chart_activity(request):
-        """API endpoint to get activity data for the line chart"""
-        try:
-            # Get requested time range (default to 7 days)
-            range_days = int(request.query_params.get("range", 7))
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Get daily classification counts for the requested range
-            cursor.execute("""
-                SELECT DATE(created_at) as date, COUNT(*) as count 
-                FROM results 
-                WHERE created_at >= date('now', ?) 
-                GROUP BY DATE(created_at) 
-                ORDER BY date ASC
-            """, (f'-{range_days} days',))
-            
-            daily_data = cursor.fetchall()
-            
-            # Get total and calculate average
-            total_count = sum(count for _, count in daily_data)
-            avg_count = round(total_count / len(daily_data)) if daily_data else 0
-            
-            # Calculate trend (using simple percentage change)
-            trend = 0
-            if len(daily_data) >= 2:
-                first_half = sum(count for _, count in daily_data[:len(daily_data)//2])
-                second_half = sum(count for _, count in daily_data[len(daily_data)//2:])
-                
-                if first_half > 0:
-                    trend = round(((second_half - first_half) / first_half) * 100, 1)
-            
-            # Extract dates and counts
-            dates = [date for date, _ in daily_data]
-            counts = [count for _, count in daily_data]
-            
-            conn.close()
-            
-            # Return JSON data
-            return JSONResponse({
-                "dates": dates,
-                "counts": counts,
-                "total": total_count,
-                "average": avg_count,
-                "trend": trend
-            })
-            
-        except Exception as e:
-            print(f"Error getting activity data: {e}")
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-    #################################################
-    # API route for recent classifications
-    #################################################
-    @rt("/api/recent-classifications", methods=["GET"])
-    async def api_recent_classifications(request):
-        """API endpoint to get recent classification data for the table"""
-        try:
-            # Get limit parameter with default of 10
-            limit = int(request.query_params.get("limit", 10))
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Get recent classifications
-            cursor.execute("""
-                SELECT id, category, confidence, feedback, created_at, context_source 
-                FROM results 
-                ORDER BY created_at DESC 
-                LIMIT ?
-            """, (limit,))
-            
-            recent_classifications = cursor.fetchall()
-            conn.close()
-            
-            # Generate HTML for the table body
-            html = ""
-            for id, category, confidence, feedback, created_at, context_source in recent_classifications:
-                # Determine confidence class
-                confidence_class = 'badge-warning'
-                if confidence == 'High':
-                    confidence_class = 'badge-success'
-                elif confidence == 'Low':
-                    confidence_class = 'badge-error'
-                
-                # Build the table row
-                html += f"""
-                <tr class="hover">
-                    <td>
-                        <div class="avatar cursor-pointer" onclick="document.getElementById('modal-{id[:8]}').showModal()">
-                            <div class="mask mask-squircle w-12 h-12 bg-base-300 flex items-center justify-center">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-base-content/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
-                                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                                </svg>
-                            </div>
-                        </div>
-                        
-                        <dialog id="modal-{id[:8]}" class="modal">
-                            <div class="modal-box">
-                                <h3 class="font-bold text-lg mb-2">Classification: {category}</h3>
-                                <!-- Modal content -->
-                                <div class="modal-action">
-                                    <form method="dialog">
-                                        <button class="btn">Close</button>
-                                    </form>
-                                </div>
-                            </div>
-                            <form method="dialog" class="modal-backdrop">
-                                <button>close</button>
-                            </form>
-                        </dialog>
-                    </td>
-                    <td class="font-mono text-xs">{id[:8]}...</td>
-                    <td>{category}</td>
-                    <td>
-                        <span class="badge {confidence_class}">{confidence}</span>
-                    </td>
-                """
-                
-                # Feedback cell
-                if feedback:
-                    feedback_class = "badge-success" if feedback == "positive" else "badge-error"
-                    html += f"""
-                    <td>
-                        <span class="badge {feedback_class}">{feedback}</span>
-                    </td>
-                    """
-                else:
-                    html += f"""
-                    <td>
-                        <div class="flex space-x-1">
-                            <button 
-                                class="btn btn-xs btn-circle btn-outline" 
-                                hx-post="/api/feedback"
-                                hx-vals='{{"id": "{id}", "feedback": "positive"}}'
-                                hx-swap="outerHTML"
-                                title="Positive Feedback">
-                                👍
-                            </button>
-                            <button 
-                                class="btn btn-xs btn-circle btn-outline" 
-                                hx-post="/api/feedback"
-                                hx-vals='{{"id": "{id}", "feedback": "negative"}}'
-                                hx-swap="outerHTML"
-                                title="Negative Feedback">
-                                👎
-                            </button>
-                        </div>
-                    </td>
-                    """
-                
-                # Context source and time
-                source_display = context_source if context_source else "None"
-                html += f"""
-                    <td class="max-w-xs truncate" title="{source_display}">{source_display}</td>
-                    <td>{created_at}</td>
-                    <td>
-                        <div class="dropdown dropdown-end">
-                            <label tabindex="0" class="btn btn-xs btn-ghost m-1">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z" />
-                                </svg>
-                            </label>
-                            <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
-                                <li><a onclick="document.getElementById('modal-{id[:8]}').showModal()">View Details</a></li>
-                                <li><a hx-get="/export-result?id={id}" hx-trigger="click" hx-swap="none">Export Result</a></li>
-                            </ul>
-                        </div>
-                    </td>
-                </tr>
-                """
-            
-            # Return the HTML directly for HTMX to swap
-            return HTMLResponse(html)
-            
-        except Exception as e:
-            print(f"Error getting recent classifications: {e}")
-            traceback.print_exc()
-            return HTMLResponse(f"""
-            <tr>
-                <td colspan="8" class="text-center text-error">
-                    Error loading data: {str(e)}
-                </td>
-            </tr>
-            """)
-
-    #################################################
-    # API route for feedback submission
-    #################################################
-    @rt("/api/feedback", methods=["POST"])
-    async def api_submit_feedback(request):
-        """API endpoint to submit feedback for a classification"""
-        try:
-            # Get form data
-            form_data = await request.form()
-            result_id = form_data.get("id")
-            feedback = form_data.get("feedback")
-            
-            if not result_id or not feedback:
-                return HTMLResponse("""
-                <div class="text-error">Error: Missing parameters</div>
-                """, status_code=400)
-            
-            # Validate feedback type
-            if feedback not in ["positive", "negative"]:
-                return HTMLResponse("""
-                <div class="text-error">Error: Invalid feedback type</div>
-                """, status_code=400)
-            
-            # Update the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Update the record
-            cursor.execute(
-                "UPDATE results SET feedback = ? WHERE id = ?",
-                (feedback, result_id)
-            )
-            
-            # Check if any row was affected
-            if cursor.rowcount == 0:
-                # Try batch results table
-                cursor.execute(
-                    "SELECT batch_id, results FROM batch_results WHERE batch_id = ? OR batch_id = SUBSTR(?, 1, INSTR(?, '_') - 1)",
-                    (result_id, result_id, result_id)
-                )
-                batch_result = cursor.fetchone()
-                
-                if batch_result:
-                    batch_id, results_json = batch_result
-                    
-                    # Parse the results JSON
-                    results_data = json.loads(results_json)
-                    
-                    # Find the specific result in the batch
-                    for result in results_data:
-                        if result.get("id") == result_id:
-                            # Update the feedback
-                            result["feedback"] = feedback
-                            break
-                    
-                    # Save the updated results back to the database
-                    cursor.execute(
-                        "UPDATE batch_results SET results = ? WHERE batch_id = ?",
-                        (json.dumps(results_data), batch_id)
-                    )
-            
-            conn.commit()
-            conn.close()
-            
-            # Return updated feedback pill/badge
-            feedback_class = "badge-success" if feedback == "positive" else "badge-error"
-            return HTMLResponse(f"""
-            <span class="badge {feedback_class}">{feedback}</span>
-            """)
-            
-        except Exception as e:
-            print(f"Error submitting feedback: {e}")
-            traceback.print_exc()
-            return HTMLResponse(f"""
-            <div class="text-error">Error: {str(e)}</div>
-            """, status_code=500)
-        
-#################################################
-    # API route for searching classifications
-    #################################################
-    @rt("/api/search-classifications", methods=["POST"])
-    async def api_search_classifications(request):
-        """API endpoint to search classifications"""
-        try:
-            # Get form data
-            form_data = await request.form()
-            search_query = form_data.get("classification-search", "").strip()
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Build the query
-            query = """
-                SELECT id, category, confidence, feedback, created_at, context_source 
-                FROM results 
-                WHERE 1=1
-            """
-            params = []
-            
-            # Add search conditions if query is provided
-            if search_query:
-                query += """
-                    AND (
-                        category LIKE ? OR
-                        description LIKE ? OR
-                        id LIKE ? OR
-                        context_source LIKE ?
-                    )
-                """
-                search_param = f"%{search_query}%"
-                params.extend([search_param, search_param, search_param, search_param])
-            
-            # Add order and limit
-            query += " ORDER BY created_at DESC LIMIT 20"
-            
-            # Execute the query
-            cursor.execute(query, params)
-            search_results = cursor.fetchall()
-            conn.close()
-            
-            # Generate HTML for table rows
-            html = generate_flowbite_table_rows(search_results)
-            
-            return HTMLResponse(html)
-            
-        except Exception as e:
-            print(f"Error searching classifications: {e}")
-            traceback.print_exc()
-            return HTMLResponse(f"""
-            <tr>
-                <td colspan="6" class="px-6 py-4 text-center text-red-500">
-                    Error searching data: {str(e)}
-                </td>
-            </tr>
-            """)
-
-    #################################################
-    # API route for filtering classifications
-    #################################################
-    @rt("/api/filter-classifications", methods=["POST"])
-    async def api_filter_classifications(request):
-        """API endpoint to filter classifications by category"""
-        try:
-            # Get form data
-            form_data = await request.form()
-            category = form_data.get("value", "").strip()
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Build the query
-            query = """
-                SELECT id, category, confidence, feedback, created_at, context_source 
-                FROM results 
-                WHERE 1=1
-            """
-            params = []
-            
-            # Add category filter if provided
-            if category:
-                query += " AND category = ?"
-                params.append(category)
-            
-            # Add order and limit
-            query += " ORDER BY created_at DESC LIMIT 20"
-            
-            # Execute the query
-            cursor.execute(query, params)
-            filter_results = cursor.fetchall()
-            conn.close()
-            
-            # Generate HTML for table rows
-            html = generate_flowbite_table_rows(filter_results)
-            
-            return HTMLResponse(html)
-            
-        except Exception as e:
-            print(f"Error filtering classifications: {e}")
-            traceback.print_exc()
-            return HTMLResponse(f"""
-            <tr>
-                <td colspan="6" class="px-6 py-4 text-center text-red-500">
-                    Error filtering data: {str(e)}
-                </td>
-            </tr>
-            """)
-
-    #################################################
-    # API route for sorting classifications
-    #################################################
-    @rt("/api/sort-classifications", methods=["GET"])
-    async def api_sort_classifications(request):
-        """API endpoint to sort classifications"""
-        try:
-            # Get query parameters
-            field = request.query_params.get("field", "date")
-            direction = request.query_params.get("dir", "desc")
-            
-            # Map field names to database columns
-            field_mapping = {
-                "category": "category",
-                "confidence": "confidence",
-                "date": "created_at"
-            }
-            
-            # Validate parameters
-            if field not in field_mapping:
-                field = "date"
-            
-            if direction not in ["asc", "desc"]:
-                direction = "desc"
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Build and execute query
-            query = f"""
-                SELECT id, category, confidence, feedback, created_at, context_source 
-                FROM results 
-                ORDER BY {field_mapping[field]} {direction.upper()}
-                LIMIT 20
-            """
-            
-            cursor.execute(query)
-            sorted_results = cursor.fetchall()
-            conn.close()
-            
-            # Generate HTML for table rows
-            html = generate_flowbite_table_rows(sorted_results)
-            
-            return HTMLResponse(html)
-            
-        except Exception as e:
-            print(f"Error sorting classifications: {e}")
-            traceback.print_exc()
-            return HTMLResponse(f"""
-            <tr>
-                <td colspan="6" class="px-6 py-4 text-center text-red-500">
-                    Error sorting data: {str(e)}
-                </td>
-            </tr>
-            """)
-
-    #################################################
-    # API route for pagination
-    #################################################
-    @rt("/api/classifications-page", methods=["GET"])
-    async def api_classifications_page(request):
-        """API endpoint to get a specific page of classification results"""
-        try:
-            # Get page parameter
-            page = request.query_params.get("page", "1")
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Calculate offset based on page
-            per_page = 10
-            
-            if page == "prev":
-                # We don't know the current page, so just return the first page
-                offset = 0
-            elif page == "next":
-                # Similar challenge, let's assume we're on page 1
-                offset = per_page
-            else:
-                try:
-                    page_num = int(page)
-                    offset = (page_num - 1) * per_page
-                except ValueError:
-                    offset = 0
-            
-            # Get paginated results
-            cursor.execute("""
-                SELECT id, category, confidence, feedback, created_at, context_source 
-                FROM results 
-                ORDER BY created_at DESC 
-                LIMIT ? OFFSET ?
-            """, (per_page, offset))
-            
-            page_results = cursor.fetchall()
-            conn.close()
-            
-            # Generate HTML for table rows
-            html = generate_flowbite_table_rows(page_results)
-            
-            return HTMLResponse(html)
-            
-        except Exception as e:
-            print(f"Error getting page data: {e}")
-            traceback.print_exc()
-            return HTMLResponse(f"""
-            <tr>
-                <td colspan="6" class="px-6 py-4 text-center text-red-500">
-                    Error loading page data: {str(e)}
-                </td>
-            </tr>
-            """)
-
-#################################################
-    # API route for classification details
-    #################################################
-    @rt("/api/classification-details/{result_id}", methods=["GET"])
-    async def api_classification_details(request):
-        """API endpoint to get detailed information about a specific classification"""
-        try:
-            # Get result ID from path parameter
-            result_id = request.path_params["result_id"]
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Get classification details
-            cursor.execute("""
-                SELECT id, category, confidence, description, additional_details, context_source 
-                FROM results 
-                WHERE id = ?
-            """, (result_id,))
-            
-            result = cursor.fetchone()
-            conn.close()
-            
-            if not result:
-                return HTMLResponse("""
-                <div class="mt-4">
-                    <p class="text-red-500">Classification not found</p>
-                </div>
-                """, status_code=404)
-            
-            # Extract data
-            id, category, confidence, description, additional_details, context_source = result
-            
-            # Build response HTML
-            html = f"""
-            <div class="block mt-4">
-                <span class="font-semibold">Description:</span>
-                <p class="mt-1">{description}</p>
-            </div>
-            """
-            
-            # Add additional details if available
-            if additional_details:
-                try:
-                    details = json.loads(additional_details)
-                    html += '<div class="mt-3">'
-                    for key, value in details.items():
-                        if key not in ["Main Category", "Confidence", "Description"]:
-                            html += f'<p><span class="font-semibold">{key}:</span> {value}</p>'
-                    html += '</div>'
-                except:
-                    pass
-            
-            # Add context source if available
-            if context_source:
-                html += f"""
-                <div class="mt-3" id="modal-source-container">
-                    <span class="font-semibold">Reference Source:</span> 
-                    <span id="modal-source">{context_source}</span>
-                </div>
-                """
-            
-            return HTMLResponse(html)
-            
-        except Exception as e:
-            print(f"Error getting classification details: {e}")
-            traceback.print_exc()
-            return HTMLResponse(f"""
-            <div class="mt-4">
-                <p class="text-red-500">Error loading details: {str(e)}</p>
-            </div>
-            """, status_code=500)
-
-    #################################################
-    # API route for exporting results
-    #################################################
-    @rt("/export-result", methods=["GET"])
-    async def api_export_result(request):
-        """API endpoint to export a classification result as JSON"""
-        try:
-            # Get result ID from query parameter
-            result_id = request.query_params.get("id")
-            
-            if not result_id:
-                return JSONResponse({"error": "Missing result ID"}, status_code=400)
-            
-            # Connect to the database
-            conn = sqlite3.connect(DB_PATH, timeout=30.0)
-            cursor = conn.cursor()
-            
-            # Get result data
-            cursor.execute("""
-                SELECT id, category, confidence, description, additional_details, context_source, created_at, feedback
-                FROM results 
-                WHERE id = ?
-            """, (result_id,))
-            
-            result = cursor.fetchone()
-            
-            if not result:
-                # Check batch results
-                cursor.execute("""
-                    SELECT results
-                    FROM batch_results
-                    WHERE batch_id = ? OR batch_id = SUBSTR(?, 1, INSTR(?, '_') - 1)
-                """, (result_id, result_id, result_id))
-                
-                batch_result = cursor.fetchone()
-                
-                if batch_result:
-                    batch_data = json.loads(batch_result[0])
-                    for item in batch_data:
-                        if item.get("id") == result_id:
-                            # Format the result
-                            export_data = {
-                                "id": item.get("id"),
-                                "category": item.get("category"),
-                                "confidence": item.get("confidence"),
-                                "description": item.get("description"),
-                                "details": item.get("details", {}),
-                                "feedback": item.get("feedback"),
-                                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                            }
-                            
-                            # Set content disposition to trigger download
-                            headers = {
-                                "Content-Disposition": f"attachment; filename=classification_{result_id[:8]}.json"
-                            }
-                            
-                            return JSONResponse(export_data, headers=headers)
-                
-                return JSONResponse({"error": "Result not found"}, status_code=404)
-            
-            # Extract data
-            id, category, confidence, description, additional_details, context_source, created_at, feedback = result
-            
-            # Parse additional details
-            details = {}
-            if additional_details:
-                try:
-                    details = json.loads(additional_details)
-                except:
-                    details = {"raw": additional_details}
-            
-            # Format the result
-            export_data = {
-                "id": id,
-                "category": category,
-                "confidence": confidence,
-                "description": description,
-                "details": details,
-                "context_source": context_source,
-                "created_at": created_at,
-                "feedback": feedback,
-                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-            # Set content disposition to trigger download
-            headers = {
-                "Content-Disposition": f"attachment; filename=classification_{result_id[:8]}.json"
-            }
-            
-            return JSONResponse(export_data, headers=headers)
-            
-        except Exception as e:
-            print(f"Error exporting result: {e}")
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-#################################################
-    # Image serving routes
-    #################################################
-    @rt("/image-thumbnail", methods=["GET"])
-    async def serve_image_thumbnail(request):
-        """Serve a thumbnail image for classifications"""
-        try:
-            # Get the image path from query parameters
-            image_path = request.query_params.get("path", "")
-            
-            if not image_path or not os.path.exists(image_path):
-                # Return a placeholder SVG if no image is found
-                placeholder_svg = """
-                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                    <circle cx="8.5" cy="8.5" r="1.5"></circle>
-                    <polyline points="21 15 16 10 5 21"></polyline>
-                </svg>
-                """
-                return Response(
-                    content=placeholder_svg.encode("utf-8"),
-                    media_type="image/svg+xml"
-                )
-            
-            # Get the file extension to determine content type
-            _, ext = os.path.splitext(image_path.lower())
-            
-            # Set content type based on extension
-            if ext in ['.jpg', '.jpeg']:
-                content_type = "image/jpeg"
-            elif ext == '.png':
-                content_type = "image/png"
-            elif ext == '.gif':
-                content_type = "image/gif"
-            elif ext == '.svg':
-                content_type = "image/svg+xml"
-            else:
-                content_type = "application/octet-stream"
-            
-            # Read the file
-            with open(image_path, "rb") as f:
-                content = f.read()
-            
-            # Return the image
-            return Response(
-                content=content,
-                media_type=content_type
-            )
-            
-        except Exception as e:
-            print(f"Error serving image: {e}")
-            traceback.print_exc()
-            
-            # Return a placeholder SVG if there's an error
-            placeholder_svg = """
-            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="8" x2="12" y2="12"></line>
-                <line x1="12" y1="16" x2="12.01" y2="16"></line>
-            </svg>
-            """
-            return Response(
-                content=placeholder_svg.encode("utf-8"),
-                media_type="image/svg+xml"
-            )
-
-    @rt("/context-image-thumbnail", methods=["GET"])
-    async def serve_context_image_thumbnail(request):
-        """Serve a thumbnail of context images from the RAG system"""
-        try:
-            # Get source ID from query parameters
-            source_id = request.query_params.get("source", "")
-            
-            if not source_id:
-                return Response(status_code=400)
-            
-            # Parse source ID to get filename and page
-            parts = source_id.split(", page ")
-            if len(parts) != 2:
-                return Response(status_code=400)
-            
-            filename = parts[0]
-            try:
-                page_num = int(parts[1])
-            except ValueError:
-                page_num = 1
-            
-            # Construct image path based on patterns used in the system
-            potential_paths = []
-            
-            # Try to find PDF image directory
-            pdf_name = os.path.splitext(filename)[0]  # Remove extension
-            
-            # Check different potential locations
-            pdf_dir = os.path.join(PDF_IMAGES_DIR, pdf_name)
-            if os.path.exists(pdf_dir) and os.path.isdir(pdf_dir):
-                # PDF directory found, look for page image
-                potential_paths.extend([
-                    os.path.join(pdf_dir, f"{page_num-1}.png"),  # 0-indexed
-                    os.path.join(pdf_dir, f"{page_num}.png"),    # 1-indexed
-                    os.path.join(pdf_dir, f"page_{page_num-1}.png"),
-                    os.path.join(pdf_dir, f"page_{page_num}.png")
-                ])
-            
-            # Also check direct file paths
-            potential_paths.extend([
-                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_{page_num-1}.png"),
-                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_{page_num}.png"),
-                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_page{page_num-1}.png"),
-                os.path.join(PDF_IMAGES_DIR, f"{pdf_name}_page{page_num}.png")
-            ])
-            
-            # Try all potential paths
-            image_path = None
-            for path in potential_paths:
-                if os.path.exists(path):
-                    image_path = path
-                    break
-            
-            if not image_path:
-                # Return a placeholder SVG
-                placeholder_svg = """
-                <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                    <polyline points="14 2 14 8 20 8"></polyline>
-                    <line x1="16" y1="13" x2="8" y2="13"></line>
-                    <line x1="16" y1="17" x2="8" y2="17"></line>
-                    <line x1="10" y1="9" x2="8" y2="9"></line>
-                </svg>
-                """
-                return Response(
-                    content=placeholder_svg.encode("utf-8"),
-                    media_type="image/svg+xml"
-                )
-            
-            # Read the image file
-            with open(image_path, "rb") as f:
-                content = f.read()
-            
-            # Return the image
-            return Response(
-                content=content,
-                media_type="image/png"
-            )
-            
-        except Exception as e:
-            print(f"Error serving context image: {e}")
-            traceback.print_exc()
-            
-            # Return a placeholder SVG if there's an error
-            placeholder_svg = """
-            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"></circle>
-                <line x1="12" y1="8" x2="12" y2="12"></line>
-                <line x1="12" y1="16" x2="12.01" y2="16"></line>
-            </svg>
-            """
-            return Response(
-                content=placeholder_svg.encode("utf-8"),
-                media_type="image/svg+xml"
-            )
-#################################################
-    # API route for image classification - FIXED FOR ASYNC/AWAIT ISSUE
-    #################################################
-    # In app.py, locate the API endpoint for /classify
-    @rt("/classify", methods=["POST"])
-    async def api_classify_image(request):
-        """API endpoint to classify insect image using Claude with RAG"""
-        try:
-            # Get image data and options from request JSON
-            data = await request.json()
-            image_data = data.get("image_data", "")
-            options = data.get("options", {})
-            
-            if not image_data:
-                return JSONResponse({"error": "No image data provided"}, status_code=400)
-            
-            # Make sure to use classify_image_claude here
-            result = classify_image_claude.remote(image_data, options)
-            
-            return JSONResponse(result)
-                    
-        except Exception as e:
-            print(f"Error classifying image: {e}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-
-    # Function to print RAG diagnostics - add this for debugging
-    # Add this function to your app.py
-    def print_rag_diagnostics():
-        """Print diagnostic information about RAG components"""
-        global colpali_embeddings, df, page_images
-        
-        logging.info("=== RAG DIAGNOSTICS ===")
-        logging.info(f"colpali_embeddings: {'Available' if colpali_embeddings is not None else 'None'}")
-        if colpali_embeddings is not None:
-            logging.info(f"  Type: {type(colpali_embeddings)}")
-            logging.info(f"  Length: {len(colpali_embeddings)}")
-            if len(colpali_embeddings) > 0:
-                logging.info(f"  First item type: {type(colpali_embeddings[0])}")
-                if hasattr(colpali_embeddings[0], 'shape'):
-                    logging.info(f"  First item shape: {colpali_embeddings[0].shape}")
-        
-        logging.info(f"DataFrame: {'Available' if df is not None else 'None'}")
-        if df is not None:
-            logging.info(f"  Shape: {df.shape}")
-            logging.info(f"  Columns: {df.columns.tolist()}")
-            if len(df) > 0:
-                logging.info(f"  Sample row: {df.iloc[0].to_dict()}")
-        
-        logging.info(f"page_images: {'Available' if page_images is not None else 'None'}")
-        if page_images is not None:
-            logging.info(f"  Length: {len(page_images)}")
-            if len(page_images) > 0:
-                sample_keys = list(page_images.keys())[:3]
-                for key in sample_keys:
-                    path = page_images[key]
-                    logging.info(f"  {key}: {path} (Exists: {os.path.exists(path)})")
     
-    #################################################
-    # Batch Classify API Endpoint
-    #################################################
-    @rt("/classify-batch", methods=["POST"])
-    async def api_classify_batch(request):
-        """API endpoint to classify multiple insect images in batch mode with RAG"""
-        try:
-            # Get form data with files
-            form = await request.form()
-            options_json = form.get("options", "{}")
-            options = json.loads(options_json)
-            
-            # Extract image files
-            image_files = []
-            for key in form.keys():
-                if key.startswith("image_"):
-                    image_files.append(form.get(key))
-                    
-            if not image_files:
-                return JSONResponse({"error": "No images provided"}, status_code=400)
-                
-            # Limit to 5 images
-            if len(image_files) > 5:
-                image_files = image_files[:5]
-                
-            # Process each image
-            base64_images = []
-            for file in image_files:
-                # Read file content
-                content = await file.read()
-                
-                # Convert to base64
-                base64_data = base64.b64encode(content).decode("utf-8")
-                base64_images.append(base64_data)
-                
-            if not base64_images:
-                return JSONResponse({"error": "Failed to process images"}, status_code=400)
-                
-            result = classify_batch_claude.remote(base64_images, options)
-            
-            # Return the result
-            return JSONResponse(result)
-                
-        except Exception as e:
-            print(f"Error in batch classification: {e}")
-            import traceback
-            traceback.print_exc()
-            return JSONResponse({"error": str(e)}, status_code=500)
-    
-
-    #################################################
-    # Homepage Route - Unified Classifier Dashboard
-    #################################################
-
+    #
     @rt("/")
     def homepage():
         """Render the unified classifier dashboard with enhanced carousel and RAG display"""
@@ -4951,7 +4213,7 @@ def serve():
                 const base64Data = singlePreview.src.split(',')[1];
                 
                 // Send request to API
-                fetch('/classify', {
+                fetch('/api/classify', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -5521,7 +4783,7 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-                         
+    
     # Return the FastHTML app
     return fasthtml_app
 
