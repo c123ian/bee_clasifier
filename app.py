@@ -43,7 +43,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = 
+CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -1033,6 +1033,27 @@ def get_context_image(top_sources):
     
     logging.warning(f"Could not find context image for {filename} page {page_num}")
     return None
+
+def convert_numpy_to_python(obj):
+    """Recursively convert NumPy types to Python types in a dictionary or list"""
+    import numpy as np
+    
+    if isinstance(obj, dict):
+        return {key: convert_numpy_to_python(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_to_python(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_numpy_to_python(item) for item in obj)
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
 
 # Helper function to get context image path
 def get_context_image_path(top_sources):
@@ -2365,6 +2386,9 @@ def serve():
             
             # Make sure to use classify_image_claude here
             result = classify_image_claude.remote(image_data, options)
+            
+            # Convert NumPy types to Python native types before JSON serialization
+            result = convert_numpy_to_python(result)
             
             return JSONResponse(result)
                     
