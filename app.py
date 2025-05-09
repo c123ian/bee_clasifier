@@ -43,7 +43,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLAUDE_API_KEY = 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -1172,12 +1172,125 @@ def create_image_thumbnail(image_path=None):
 
 # Helper function to get image path for a classification
 def get_classification_image_path(result_id):
-    """Attempt to find the image path for a classification result"""
-    # This is a placeholder implementation - in a real application, 
-    # you would store the image paths in the database or retrieve them
-    # from a file system based on the result ID
+    """Retrieve the image path for a classification result from database and filesystem"""
+    try:
+        # Connect to the database
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # First, check the single results table for this ID
+        cursor.execute("""
+            SELECT additional_details FROM results 
+            WHERE id = ?
+        """, (result_id,))
+        
+        result = cursor.fetchone()
+        
+        if result and result[0]:
+            # Parse the additional details JSON to find image info
+            try:
+                details = json.loads(result[0])
+                
+                # Look for top sources first (these would be from RAG context)
+                top_sources = details.get('top_sources', [])
+                if top_sources and len(top_sources) > 0:
+                    source = top_sources[0]
+                    image_key = source.get('image_key')
+                    
+                    if image_key and image_key in page_images:
+                        path = page_images[image_key]
+                        if os.path.exists(path):
+                            return path
+                            
+                    # Try alternate paths if the image_key doesn't work
+                    if image_key:
+                        parts = image_key.split('_')
+                        if len(parts) >= 2:
+                            key_filename = '_'.join(parts[:-1])
+                            key_page = parts[-1]
+                            
+                            # Check different possible paths
+                            potential_paths = [
+                                os.path.join(PDF_IMAGES_DIR, key_filename, f"{key_page}.png"),
+                                os.path.join(PDF_IMAGES_DIR, key_filename, f"page_{key_page}.png"),
+                                os.path.join(PDF_IMAGES_DIR, f"{key_filename}_{key_page}.png"),
+                                os.path.join(PDF_IMAGES_DIR, "FIT-Counts-guide", f"{key_page}.png")
+                            ]
+                            
+                            for path in potential_paths:
+                                if os.path.exists(path):
+                                    return path
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        # If we couldn't find it in the results table, check batch_results
+        batch_id = result_id
+        if '_' in result_id:
+            # This could be a batch result with format like "batch_id_index"
+            batch_id = result_id.split('_')[0]
+        
+        cursor.execute("""
+            SELECT results FROM batch_results 
+            WHERE batch_id = ?
+        """, (batch_id,))
+        
+        batch_result = cursor.fetchone()
+        
+        if batch_result and batch_result[0]:
+            try:
+                results_data = json.loads(batch_result[0])
+                
+                # Find the specific result in the batch
+                for result in results_data:
+                    if result.get("id") == result_id:
+                        # Save the image data to a temporary file
+                        temp_dir = os.path.join(TEMP_UPLOAD_DIR, "classification_images")
+                        os.makedirs(temp_dir, exist_ok=True)
+                        
+                        # Create temporary image file
+                        temp_path = os.path.join(temp_dir, f"{result_id}.jpg")
+                        
+                        # Check if we already have the image
+                        if os.path.exists(temp_path):
+                            return temp_path
+                        
+                        # For batch results, we would need to store temporary images since
+                        # we don't have the original files. This is just a placeholder -
+                        # in a real implementation this would utilize the image data from batch_results
+                        return None
+            except (json.JSONDecodeError, TypeError):
+                pass
+        
+        conn.close()
+        
+        # Check for results saved in the file system
+        result_file = os.path.join(RESULTS_FOLDER, f"{result_id}.json")
+        if os.path.exists(result_file):
+            try:
+                with open(result_file, "r") as f:
+                    result_data = json.load(f)
+                    
+                # Process similar to above
+                # This would need custom implementation based on your file structure
+                pass
+            except (json.JSONDecodeError, IOError):
+                pass
+        
+        # If nothing works, try the FIT-Counts-guide as a fallback for demo purposes
+        # This is just a demo - in production you'd want more robust matching
+        fit_guide_dir = os.path.join(PDF_IMAGES_DIR, "FIT-Counts-guide")
+        if os.path.exists(fit_guide_dir):
+            sample_images = [os.path.join(fit_guide_dir, f) for f in os.listdir(fit_guide_dir) 
+                            if f.endswith(('.png', '.jpg', '.jpeg'))]
+            if sample_images:
+                # Just return the first image as a sample
+                return sample_images[0]
     
-    # For now, we'll return None to use placeholders
+    except Exception as e:
+        logging.error(f"Error getting classification image path: {e}")
+        traceback.print_exc()
+    
+    # If all else fails, return None to use a placeholder
     return None
 
 
@@ -1331,11 +1444,317 @@ def generate_flowbite_table_rows(results):
     
     return html
 
-# Generate classification using Claude's API for a single image
+# NEW: Functions for Plant-Insect Relationship Network Visualization
 
+# Helper function to call Claude API for structured data extraction
+async def call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219"):
+    """Call Claude API to extract structured data"""
+    try:
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        }
+        
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["content"][0]["text"]
+        
+    except Exception as e:
+        logging.error(f"Error calling Claude API: {e}")
+        return "[]"  # Return empty JSON array as string on error
+
+# Build network of insect-plant relationships
+async def build_insect_plant_network(insect_filter=None):
+    """Build network data structure from classified insects and RAG data"""
+    global colpali_embeddings, df, page_images
+    
+    # Initialize network structure
+    nodes = []
+    links = []
+    
+    try:
+        # Connect to the database
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # Get classified insects
+        if insect_filter:
+            cursor.execute(
+                "SELECT DISTINCT category FROM results WHERE category = ?",
+                (insect_filter,)
+            )
+        else:
+            cursor.execute(
+                "SELECT DISTINCT category FROM results"
+            )
+        
+        insect_categories = [row[0] for row in cursor.fetchall()]
+        
+        # For each insect category, find relationships with plants
+        for insect in insect_categories:
+            # Count occurrences of this insect for node sizing
+            cursor.execute(
+                "SELECT COUNT(*) FROM results WHERE category = ?",
+                (insect,)
+            )
+            count = cursor.fetchone()[0]
+            
+            # Add insect node
+            nodes.append({
+                "id": insect,
+                "group": "insect",
+                "value": min(count * 5, 50),  # Scale value by count, max of 50
+                "type": "insect"
+            })
+            
+            # Use RAG to find plant relationships
+            plant_relationships = await find_plant_relationships(insect)
+            
+            # Add plants and relationships to the network
+            for plant_info in plant_relationships:
+                plant_name = plant_info["plant"]
+                
+                # Add plant node if not already in network
+                if not any(node["id"] == plant_name for node in nodes):
+                    nodes.append({
+                        "id": plant_name,
+                        "group": "plant",
+                        "value": plant_info.get("strength", 10),
+                        "type": "plant"
+                    })
+                
+                # Add relationship link
+                links.append({
+                    "source": insect,
+                    "target": plant_name,
+                    "value": plant_info.get("strength", 5),
+                    "type": plant_info.get("relationship_type", "interacts")
+                })
+        
+        conn.close()
+        
+        return {
+            "nodes": nodes,
+            "links": links
+        }
+    except Exception as e:
+        logging.error(f"Error building network data: {e}")
+        traceback.print_exc()
+        return {"nodes": [], "links": []}
+
+# Find plant relationships for an insect using RAG
+async def find_plant_relationships(insect_name):
+    """Use RAG to find plant relationships for an insect species"""
+    relationships = []
+    
+    try:
+        # Construct multiple queries to find different types of relationships
+        queries = [
+            f"What plants do {insect_name} pollinate?",
+            f"What plants do {insect_name} feed on?",
+            f"What plants are important habitats for {insect_name}?"
+        ]
+        
+        # Process each query to find relationships
+        for query in queries:
+            # Use existing RAG retrieval to find relevant context
+            context_images, top_sources = await retrieve_relevant_documents(query, top_k=3)
+            
+            if top_sources and len(top_sources) > 0:
+                # Extract context paragraphs from the documents
+                context_texts = []
+                for source in top_sources:
+                    try:
+                        # Get document content
+                        idx = source.get('idx')
+                        if idx is not None and idx < len(df):
+                            context_texts.append(df.iloc[idx]['text'])
+                    except Exception as e:
+                        logging.error(f"Error getting context text: {e}")
+                
+                if context_texts:
+                    # Use Claude API to extract relationships from context
+                    relationships_from_context = await extract_relationships_from_context(
+                        insect_name, 
+                        query, 
+                        context_texts
+                    )
+                    relationships.extend(relationships_from_context)
+        
+        # Remove duplicates based on plant name
+        unique_plants = {}
+        for rel in relationships:
+            plant_name = rel["plant"]
+            if plant_name not in unique_plants:
+                unique_plants[plant_name] = rel
+            elif rel.get("strength", 0) > unique_plants[plant_name].get("strength", 0):
+                unique_plants[plant_name] = rel
+        
+        return list(unique_plants.values())
+        
+    except Exception as e:
+        logging.error(f"Error finding plant relationships for {insect_name}: {e}")
+        return []
+
+# Extract structured plant relationships from context
+async def extract_relationships_from_context(insect, query, context_texts):
+    """Extract structured plant relationships from context using Claude API"""
+    try:
+        # Combine context texts
+        combined_context = "\n\n".join(context_texts)
+        
+        # Prepare the prompt for Claude
+        prompt = f"""
+        Based on the following context information, identify plants that have a relationship with {insect}.
+        
+        Context:
+        {combined_context}
+        
+        Query: {query}
+        
+        Extract ONLY plant names that have a definite relationship with {insect} based on the context.
+        For each plant, determine:
+        1. The plant name
+        2. The type of relationship (e.g., pollination, food source, habitat)
+        3. The strength of the relationship (1-10, where 10 is strongest)
+        
+        If NO plant relationships are mentioned in the context, return an empty list.
+        
+        Format your response as a JSON array of objects with these properties:
+        [
+          {{
+            "plant": "plant name",
+            "relationship_type": "type of relationship",
+            "strength": number (1-10),
+            "source": "brief mention of where this came from"
+          }}
+        ]
+        
+        ONLY include plants with clear relationships to {insect} from the context.
+        """
+        
+        # Call Claude API
+        response = await call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219")
+        
+        # Parse the response (assumption: response is a JSON array)
+        try:
+            relationships = json.loads(response)
+            if not isinstance(relationships, list):
+                relationships = []
+        except json.JSONDecodeError:
+            logging.error(f"Error parsing JSON from Claude response: {response}")
+            relationships = []
+        
+        return relationships
+        
+    except Exception as e:
+        logging.error(f"Error extracting relationships from context: {e}")
+        return []
+
+# Get detailed relationship information from RAG
+async def get_relationship_from_rag(insect, plant):
+    """Get detailed relationship information from RAG"""
+    try:
+        # Create a specific query about this relationship
+        query = f"What is the relationship between {insect} and {plant}? How do they interact?"
+        
+        # Use the existing RAG retrieval function
+        context_images, top_sources = await retrieve_relevant_documents(query, top_k=2)
+        
+        # Extract context text from sources
+        context_texts = []
+        if top_sources and len(top_sources) > 0:
+            for source in top_sources:
+                try:
+                    # Get document content
+                    idx = source.get('idx')
+                    if idx is not None and idx < len(df):
+                        context_texts.append(df.iloc[idx]['text'])
+                        source_info = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
+                except Exception as e:
+                    logging.error(f"Error getting context text: {e}")
+        
+        if not context_texts:
+            return {
+                "type": "interaction",
+                "description": "No specific information about this relationship was found in the reference materials."
+            }
+        
+        # Combine context texts
+        combined_context = "\n\n".join(context_texts)
+        
+        # Prepare the prompt for Claude
+        prompt = f"""
+        Based on the following context information, describe the relationship between {insect} and {plant}.
+        
+        Context:
+        {combined_context}
+        
+        Extract:
+        1. The type of relationship (e.g., pollination, food source, habitat)
+        2. A detailed description of how these species interact
+        
+        If the context doesn't mention this specific relationship, say that.
+        
+        Format your response as a JSON object with these properties:
+        {{
+          "type": "type of relationship",
+          "description": "detailed description of the relationship",
+          "source": "source of this information from the context"
+        }}
+        """
+        
+        # Call Claude API
+        response = await call_claude_for_structured_data(prompt)
+        
+        # Parse the response
+        try:
+            relationship_data = json.loads(response)
+            if not isinstance(relationship_data, dict):
+                relationship_data = {
+                    "type": "unknown",
+                    "description": "Could not extract relationship details from context."
+                }
+            
+            # Add source information if available
+            if top_sources and len(top_sources) > 0:
+                source = top_sources[0]
+                relationship_data["source"] = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
+                
+        except json.JSONDecodeError:
+            logging.error(f"Error parsing JSON from Claude response: {response}")
+            relationship_data = {
+                "type": "unknown",
+                "description": "Could not extract relationship details from context."
+            }
+        
+        return relationship_data
+        
+    except Exception as e:
+        logging.error(f"Error getting relationship details: {e}")
+        return {
+            "type": "unknown",
+            "description": f"Error retrieving relationship information: {str(e)}"
+        }
+
+# Generate classification using Claude's API for a single image
 @app.function(
     image=image,
-    cpu=1.0,
+    gpu=modal.gpu.A10G(count=1),
     timeout=600,  # Increased timeout
     volumes={DATA_DIR: bee_volume}
 )
@@ -1645,7 +2064,7 @@ Please examine both images, using the document image to inform your analysis of 
 
 @app.function(
     image=image,
-    cpu=1.0,
+    gpu=modal.gpu.A10G(count=1),
     timeout=300,
     volumes={DATA_DIR: bee_volume}
 )
@@ -1894,7 +2313,7 @@ async def classify_document_claude(image_data: str, options: Dict[str, bool]) ->
 # Batch classification function
 @app.function(
     image=image,
-    cpu=1.0,
+    gpu=modal.gpu.A10G(count=1),
     timeout=500,  # Longer timeout for batch processing
     volumes={DATA_DIR: bee_volume}
 )
@@ -2474,6 +2893,57 @@ def serve():
             import traceback
             traceback.print_exc()
             return JSONResponse({"error": str(e)}, status_code=500)
+            
+    # NEW: API Endpoints for Network Visualization
+    @rt("/api/insect-network")
+    async def get_insect_network(request):
+        """Get network data for insects and their plant relationships"""
+        try:
+            # Get query parameter for specific insect if provided
+            insect_filter = request.query_params.get("insect", None)
+            
+            # Build network data based on classified insects and RAG
+            network_data = await build_insect_plant_network(insect_filter)
+            
+            # Return as JSON
+            return JSONResponse(network_data)
+        except Exception as e:
+            logging.error(f"Error generating network: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @rt("/api/relationship-details")
+    async def get_relationship_details(request):
+        """Get details about a specific insect-plant relationship"""
+        try:
+            # Get parameters
+            source = request.query_params.get("source")
+            target = request.query_params.get("target")
+            
+            if not source or not target:
+                return HTMLResponse("<p>Select a relationship to view details</p>")
+            
+            # Get relationship details from RAG
+            details = await get_relationship_from_rag(source, target)
+            
+            # Return HTML fragment for HTMX
+            return HTMLResponse(f"""
+                <div class="bg-accent text-accent-content p-4 rounded-lg">
+                    <h3 class="font-bold text-lg">{source} → {target}</h3>
+                    <div class="text-sm italic mb-3">
+                        Relationship: {details.get('type', 'interaction')}
+                    </div>
+                    <p>{details.get('description', 'No detailed information available.')}</p>
+                    {f'<p class="text-xs mt-2">Source: {details["source"]}</p>' if details.get('source') else ''}
+                </div>
+            """)
+        except Exception as e:
+            logging.error(f"Error getting relationship details: {e}")
+            return HTMLResponse(f"""
+                <div class="bg-error text-error-content p-4 rounded-lg">
+                    <p>Error loading relationship details: {str(e)}</p>
+                </div>
+            """)
     
     # Additional API routes for feedback, charts, etc.
     @rt("/api/feedback", methods=["POST"])
@@ -2771,6 +3241,334 @@ def serve():
                 content=placeholder_svg.encode("utf-8"),
                 media_type="image/svg+xml"
             )
+    
+    #################################################
+    # Dashboard component for Plant-Insect Network visualization
+    #################################################
+    def build_network_visualization(stats):
+        """Create the network visualization component for the dashboard"""
+        return Div(
+            H2("Plant-Insect Relationship Network", cls="text-xl font-bold mb-4 text-bee-green"),
+            P("Explore connections between classified insects and plants in the ecosystem", cls="mb-4"),
+            
+            # Controls
+            Div(
+                Select(
+                    Option("All classified insects", value=""),
+                    *[
+                        Option(category, value=category)
+                        for category, _ in stats["category_counts"]
+                    ],
+                    cls="select select-bordered w-full max-w-xs",
+                    hx_get="/api/insect-network",
+                    hx_trigger="change",
+                    hx_target="#network-container",
+                    hx_indicator="#network-loading"
+                ),
+                
+                Button(
+                    "Refresh Network",
+                    cls="btn btn-sm",
+                    hx_get="/api/insect-network",
+                    hx_trigger="click",
+                    hx_target="#network-container",
+                    hx_indicator="#network-loading"
+                ),
+                
+                cls="flex flex-wrap gap-2 mb-4"
+            ),
+            
+            # Network visualization container
+            Div(
+                Div(id="network-svg", cls="w-full h-[450px]"),
+                
+                # Legend
+                Div(
+                    Div(
+                        Span(cls="w-3 h-3 inline-block mr-1 rounded-full bg-warning"),
+                        Span("Insects"),
+                        cls="flex items-center mb-1"
+                    ),
+                    Div(
+                        Span(cls="w-3 h-3 inline-block mr-1 rounded-full bg-success"),
+                        Span("Plants"),
+                        cls="flex items-center"
+                    ),
+                    cls="absolute bottom-2 right-2 bg-base-100 p-2 rounded-lg shadow-sm text-xs"
+                ),
+                
+                # Loading indicator
+                Div(
+                    Span(cls="loading loading-spinner loading-lg text-primary"),
+                    id="network-loading",
+                    cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-70"
+                ),
+                
+                id="network-container",
+                cls="relative bg-base-200 p-4 rounded-lg min-h-[450px]"
+            ),
+            
+            # Relationship details panel
+            Div(
+                P("Hover over connections in the network to see relationship details", 
+                  cls="text-center text-base-content/50 italic"),
+                id="relationship-details",
+                cls="mt-4 bg-base-200 p-4 rounded-lg"
+            ),
+            
+            # D3.js for visualization
+            Script(src="https://cdn.jsdelivr.net/npm/d3@7"),
+            
+            # Network visualization script
+            Script("""
+            document.addEventListener('DOMContentLoaded', function() {
+                // Initialize D3.js network visualization
+                setupNetworkVisualization();
+                
+                // Load initial data
+                fetchNetworkData();
+                
+                // Function to set up the network visualization
+                function setupNetworkVisualization() {
+                    const svg = d3.select("#network-svg")
+                        .append("svg")
+                        .attr("width", "100%")
+                        .attr("height", "100%");
+                        
+                    svg.append("text")
+                        .attr("x", "50%")
+                        .attr("y", "50%")
+                        .attr("text-anchor", "middle")
+                        .text("Loading network data...");
+                }
+                
+                // Function to fetch network data
+                function fetchNetworkData(filter = "") {
+                    const url = filter ? `/api/insect-network?insect=${filter}` : '/api/insect-network';
+                    
+                    fetch(url)
+                        .then(response => response.json())
+                        .then(data => {
+                            updateNetworkVisualization(data);
+                        })
+                        .catch(error => {
+                            console.error('Error fetching network data:', error);
+                            d3.select("#network-svg svg").html("");
+                            d3.select("#network-svg svg")
+                                .append("text")
+                                .attr("x", "50%")
+                                .attr("y", "50%")
+                                .attr("text-anchor", "middle")
+                                .text("Error loading network data. Please try again.");
+                        });
+                }
+                
+                // Function to update the network visualization with new data
+                function updateNetworkVisualization(data) {
+                    // Clear the SVG
+                    d3.select("#network-svg").html("");
+                    
+                    // Create new SVG
+                    const svg = d3.select("#network-svg")
+                        .append("svg")
+                        .attr("width", "100%")
+                        .attr("height", "100%");
+                        
+                    // Check if we have data
+                    if (!data.nodes || data.nodes.length === 0) {
+                        svg.append("text")
+                            .attr("x", "50%")
+                            .attr("y", "50%")
+                            .attr("text-anchor", "middle")
+                            .text("No network data available yet. Classify some insects to build the network!");
+                        return;
+                    }
+                    
+                    // Get dimensions
+                    const width = svg.node().getBoundingClientRect().width;
+                    const height = svg.node().getBoundingClientRect().height;
+                    
+                    // Create a group for the visualization
+                    const g = svg.append("g")
+                        .attr("transform", `translate(${width/2}, ${height/2})`);
+                        
+                    // Define node colors by group
+                    const color = d3.scaleOrdinal()
+                        .domain(["insect", "plant"])
+                        .range(["#F6AD55", "#68D391"]); // Warning and success colors
+                        
+                    // Create a tooltip
+                    const tooltip = d3.select("body").append("div")
+                        .attr("class", "tooltip")
+                        .style("position", "absolute")
+                        .style("background-color", "white")
+                        .style("border", "1px solid #ddd")
+                        .style("border-radius", "4px")
+                        .style("padding", "8px")
+                        .style("pointer-events", "none")
+                        .style("opacity", 0);
+                        
+                    // Create a force simulation
+                    const simulation = d3.forceSimulation(data.nodes)
+                        .force("link", d3.forceLink(data.links).id(d => d.id).distance(100))
+                        .force("charge", d3.forceManyBody().strength(-300))
+                        .force("center", d3.forceCenter(0, 0))
+                        .force("collision", d3.forceCollide().radius(d => Math.sqrt(d.value) * 2 + 10));
+                        
+                    // Define arrow markers for directional links
+                    g.append("defs").selectAll("marker")
+                        .data(["pollinates", "feeds_on", "habitat", "interacts"])
+                        .enter().append("marker")
+                        .attr("id", d => `arrow-${d}`)
+                        .attr("viewBox", "0 -5 10 10")
+                        .attr("refX", 20)
+                        .attr("refY", 0)
+                        .attr("markerWidth", 6)
+                        .attr("markerHeight", 6)
+                        .attr("orient", "auto")
+                        .append("path")
+                        .attr("fill", d => d === "pollinates" ? "#F6AD55" : "#68D391")
+                        .attr("d", "M0,-5L10,0L0,5");
+                        
+                    // Create the links
+                    const link = g.append("g")
+                        .selectAll("path")
+                        .data(data.links)
+                        .enter().append("path")
+                        .attr("stroke", d => d.type === "pollinates" ? "#F6AD55" : "#68D391")
+                        .attr("stroke-opacity", 0.6)
+                        .attr("stroke-width", d => Math.sqrt(d.value))
+                        .attr("marker-end", d => `url(#arrow-${d.type})`)
+                        .attr("fill", "none")
+                        .on("mouseover", function(event, d) {
+                            // Highlight the link
+                            d3.select(this)
+                                .attr("stroke-opacity", 1)
+                                .attr("stroke-width", d => Math.sqrt(d.value) + 2);
+                                
+                            // Show tooltip
+                            tooltip.transition()
+                                .duration(200)
+                                .style("opacity", .9);
+                            tooltip.html(`${d.source.id} ${d.type} ${d.target.id}`)
+                                .style("left", (event.pageX + 10) + "px")
+                                .style("top", (event.pageY - 28) + "px");
+                                
+                            // Fetch relationship details
+                            fetch(`/api/relationship-details?source=${encodeURIComponent(d.source.id)}&target=${encodeURIComponent(d.target.id)}`)
+                                .then(response => response.text())
+                                .then(html => {
+                                    document.getElementById('relationship-details').innerHTML = html;
+                                })
+                                .catch(error => {
+                                    console.error('Error fetching relationship details:', error);
+                                });
+                        })
+                        .on("mouseout", function() {
+                            d3.select(this)
+                                .attr("stroke-opacity", 0.6)
+                                .attr("stroke-width", d => Math.sqrt(d.value));
+                                
+                            tooltip.transition()
+                                .duration(500)
+                                .style("opacity", 0);
+                        });
+                        
+                    // Create the nodes
+                    const node = g.append("g")
+                        .selectAll("g")
+                        .data(data.nodes)
+                        .enter().append("g")
+                        .call(d3.drag()
+                            .on("start", dragstarted)
+                            .on("drag", dragged)
+                            .on("end", dragended))
+                        .on("mouseover", function(event, d) {
+                            // Show tooltip
+                            tooltip.transition()
+                                .duration(200)
+                                .style("opacity", .9);
+                            tooltip.html(`${d.id} (${d.group})`)
+                                .style("left", (event.pageX + 10) + "px")
+                                .style("top", (event.pageY - 28) + "px");
+                                
+                            // Highlight connected links
+                            link.attr("stroke-opacity", l => 
+                                l.source.id === d.id || l.target.id === d.id ? 1 : 0.1);
+                        })
+                        .on("mouseout", function() {
+                            tooltip.transition()
+                                .duration(500)
+                                .style("opacity", 0);
+                                
+                            // Reset link highlighting
+                            link.attr("stroke-opacity", 0.6);
+                        });
+                        
+                    // Add circles for the nodes
+                    node.append("circle")
+                        .attr("r", d => Math.sqrt(d.value))
+                        .attr("fill", d => color(d.group))
+                        .attr("stroke", "#fff")
+                        .attr("stroke-width", 1.5);
+                        
+                    // Add labels to the nodes
+                    node.append("text")
+                        .text(d => d.id)
+                        .attr("font-size", 10)
+                        .attr("dx", 12)
+                        .attr("dy", ".35em")
+                        .attr("text-anchor", "middle")
+                        .style("pointer-events", "none");
+                        
+                    // Update positions in simulation tick
+                    simulation.on("tick", () => {
+                        link.attr("d", d => {
+                            const dx = d.target.x - d.source.x;
+                            const dy = d.target.y - d.source.y;
+                            const dr = Math.sqrt(dx * dx + dy * dy);
+                            return `M${d.source.x},${d.source.y}A${dr},${dr} 0 0,1 ${d.target.x},${d.target.y}`;
+                        });
+                        
+                        node.attr("transform", d => `translate(${d.x},${d.y})`);
+                    });
+                    
+                    // Drag functions
+                    function dragstarted(event, d) {
+                        if (!event.active) simulation.alphaTarget(0.3).restart();
+                        d.fx = d.x;
+                        d.fy = d.y;
+                    }
+                    
+                    function dragged(event, d) {
+                        d.fx = event.x;
+                        d.fy = event.y;
+                    }
+                    
+                    function dragended(event, d) {
+                        if (!event.active) simulation.alphaTarget(0);
+                        d.fx = null;
+                        d.fy = null;
+                    }
+                }
+                
+                // Handle HTMX events
+                document.body.addEventListener('htmx:afterSwap', function(evt) {
+                    if (evt.detail.target.id === 'network-container') {
+                        // Parse the JSON from the response
+                        try {
+                            const data = JSON.parse(evt.detail.xhr.response);
+                            updateNetworkVisualization(data);
+                        } catch (e) {
+                            console.error('Error parsing network data:', e);
+                        }
+                    }
+                });
+            });
+            """),
+            
+            cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
+        )
     
     # Include homepage and dashboard routes
     @rt("/dashboard")
@@ -3186,7 +3984,7 @@ def serve():
             cls="mb-8"
         )
 
-        # Map Section - Add this after the charts_section and before confidence_feedback_section
+        # Map Section - Add this after the charts_section and before network_visualization
         map_section = Div(
             H2("Conservation Project Map", cls="text-xl font-bold mb-4 text-bee-green"),
             Div(
@@ -3201,6 +3999,9 @@ def serve():
             ),
             cls="mb-8"
         )
+        
+        # Build plant-insect network visualization component
+        network_visualization = build_network_visualization(stats)
         
         # Confidence & Feedback Section
         confidence_feedback_section = Div(
@@ -3744,47 +4545,43 @@ def serve():
             Div(
                 # Tab navigation
                 Div(
-                    Div(
-                        Div(role="tablist", cls="tabs tabs-boxed bg-base-200 p-1 mb-6"),
-                        
-                        Button(
-                            "Recent Classifications", 
-                            cls="tab tab-active",
-                            id="tab-recent",
-                            onclick="showTab('recent')",
-                            role="tab",
-                            aria_selected="true"
-                        ),
-                        
-                        Button(
-                            "All Classifications", 
-                            cls="tab",
-                            id="tab-all",
-                            onclick="showTab('all')",
-                            role="tab",
-                            aria_selected="false"
-                        ),
-                        
-                        cls="flex justify-center"
+                    Div(role="tablist", cls="tabs tabs-boxed bg-base-200 p-1 mb-6"),
+                    
+                    Button(
+                        "Recent Classifications", 
+                        cls="tab tab-active",
+                        id="tab-recent",
+                        onclick="showTab('recent')",
+                        role="tab",
+                        aria_selected="true"
                     ),
                     
-                    # Tab content containers
+                    Button(
+                        "All Classifications", 
+                        cls="tab",
+                        id="tab-all",
+                        onclick="showTab('all')",
+                        role="tab",
+                        aria_selected="false"
+                    ),
+                    
+                    cls="flex justify-center"
+                ),
+                
+                # Tab content containers
+                Div(
+                    # DaisyUI Table Content
                     Div(
-                        # DaisyUI Table Content
-                        Div(
-                            daisyui_table,
-                            id="tab-content-recent",
-                            cls="block"
-                        ),
-                        
-                        # Flowbite Table Content
-                        Div(
-                            flowbite_table,
-                            id="tab-content-all",
-                            cls="hidden"
-                        ),
-                        
-                        cls="w-full"
+                        daisyui_table,
+                        id="tab-content-recent",
+                        cls="block"
+                    ),
+                    
+                    # Flowbite Table Content
+                    Div(
+                        flowbite_table,
+                        id="tab-content-all",
+                        cls="hidden"
                     ),
                     
                     # Simple tab switching script
@@ -3857,6 +4654,7 @@ def serve():
                 summary_cards,
                 charts_section,
                 map_section,
+                network_visualization,  # Add the network visualization to the dashboard
                 confidence_feedback_section,
                 tables_section,
                 rag_section,
@@ -3870,6 +4668,28 @@ def serve():
     @rt("/")
     def homepage():
         """Render the unified classifier dashboard with enhanced carousel and RAG display"""
+        
+        # Navigation bar
+        navbar = Div(
+            Div(
+                A(
+                    Span("🐝", cls="text-xl"),
+                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
+                    href="/",
+                    cls="flex items-center"
+                ),
+                Div(
+                    A(
+                        "Dashboard",
+                        href="/dashboard",
+                        cls="btn btn-sm btn-ghost"
+                    ),
+                    cls="flex-none"
+                ),
+                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
+            ),
+            cls="w-full"
+        )
         
         # Create toggle switches for classification options
         def create_toggle(name, label, checked=False, description=None):
@@ -3905,14 +4725,44 @@ def serve():
                         
             return toggle_element
         
-        # Classification options panel with RAG option
+        # Classification options panel with only RAG toggle
         classification_options = Div(
             H3("Classification Options", cls="text-lg font-semibold mb-4 text-bee-green"),
             create_toggle("use_rag", "Use Context-Enhanced Classification (RAG)", True, 
                         "Enhances classification accuracy using relevant reference materials"),
-            create_toggle("detailed_description", "Detailed Description (shapes, colors)"),
-            create_toggle("plant_classification", "Plant Classification"),
-            create_toggle("taxonomy", "Taxonomic Classification"),
+            cls="mb-6 p-4 bg-base-200 rounded-lg"
+        )
+        
+        # Classification steps component
+        classification_steps = Div(
+            H3("Classification Process", cls="text-lg font-semibold mb-4 text-bee-green"),
+            Div(
+                NotStr("""
+                <ul class="steps steps-horizontal lg:steps-horizontal w-full">
+                    <li class="step" id="step-classify">
+                        <div class="flex flex-col items-center">
+                            <span class="text-xl mb-1">🐝</span>
+                            <span>Insect Classification</span>
+                        </div>
+                    </li>
+                    <li class="step" id="step-plants">
+                        <div class="flex flex-col items-center">
+                            <span class="text-xl mb-1">🌱</span>
+                            <span>Plant Identification</span>
+                        </div>
+                    </li>
+                    <li class="step" id="step-taxonomy">
+                        <div class="flex flex-col items-center">
+                            <span class="text-xl mb-1">🕵️</span>
+                            <span>Taxonomic Analysis</span>
+                        </div>
+                    </li>
+                </ul>
+                """),
+                cls="w-full mb-4"
+            ),
+            P("All steps will be performed automatically during classification", 
+            cls="text-sm text-base-content/70 text-center"),
             cls="mb-6 p-4 bg-base-200 rounded-lg"
         )
         
@@ -3970,6 +4820,7 @@ def serve():
             H2("Insect Image Classification", cls="text-xl font-bold mb-4 text-bee-green"),
             upload_section,
             classification_options,
+            classification_steps,  # Added the steps component here
             Button(
                 "Classify Insects",
                 cls="btn btn-primary w-full",
@@ -4047,860 +4898,7 @@ def serve():
             cls="w-full bg-base-100 p-6 rounded-lg shadow-lg custom-border border"
         )
         
-        # Navigation bar
-        navbar = Div(
-            Div(
-                A(
-                    Span("🐝", cls="text-xl"),
-                    Span("Insect Classifier", cls="ml-2 text-xl font-semibold"),
-                    href="/",
-                    cls="flex items-center"
-                ),
-                Div(
-                    A(
-                        "Dashboard",
-                        href="/dashboard",
-                        cls="btn btn-sm btn-ghost"
-                    ),
-                    cls="flex-none"
-                ),
-                cls="navbar bg-base-200 rounded-lg mb-8 shadow-sm"
-            ),
-            cls="w-full"
-        )
-        
-        # Add updated script for form handling with carousel and RAG display enhancements
-        form_script = Script("""
-        document.addEventListener('DOMContentLoaded', function() {
-            // Form elements - cache all DOM elements we'll need to reference
-            const imageInput = document.getElementById('image-input');
-            const singlePreview = document.getElementById('single-preview');
-            const batchPreviewsContainer = document.getElementById('batch-previews');
-            const countDisplay = document.getElementById('count-display');
-            const imageCountElem = document.getElementById('image-count');
-            const classifyButton = document.getElementById('classify-button');
-            
-            // Results elements - references to DOM elements for displaying results
-            const loadingIndicator = document.getElementById('loading-indicator').parentElement;
-            const resultsPlaceholder = document.getElementById('results-placeholder');
-            const resultsContent = document.getElementById('results-content');
-            const singleResult = document.getElementById('single-result');
-            const batchResults = document.getElementById('batch-results');
-            const resultActions = document.getElementById('result-actions');
-            const copyButton = document.getElementById('copy-button');
-            const newButton = document.getElementById('new-button');
-            
-            // RAG Context elements
-            const ragContextSection = document.getElementById('rag-context-section');
-            const ragContextDisplay = document.getElementById('rag-context-display');
-            
-            // Mode tracking variables
-            let isBatchMode = false;
-            const MAX_IMAGES = 5;
-            let selectedFiles = [];
-            let rawResponseText = '';
-            
-            // Debug elements on page load
-            console.log("DOM loaded - Bee Classifier Initialized");
-            console.log("Button state:", classifyButton ? (classifyButton.disabled ? "disabled" : "enabled") : "button not found");
-            
-            // Explicitly attach the change event listener
-            // This ensures the file input triggers our handler even if the HTML attribute binding fails
-            if (imageInput) {
-                console.log("Setting up file input change listener");
-                imageInput.addEventListener('change', function(event) {
-                    console.log("File input changed - files selected:", event.target.files.length);
-                    handleFileSelection(event);
-                });
-            } else {
-                console.error("Critical Error: Image input element not found");
-            }
-            
-            // Get options from the form controls
-            function getOptions() {
-                return {
-                    use_rag: document.querySelector('input[name="use_rag"]').checked,
-                    detailed_description: document.querySelector('input[name="detailed_description"]').checked,
-                    plant_classification: document.querySelector('input[name="plant_classification"]').checked,
-                    taxonomy: document.querySelector('input[name="taxonomy"]').checked
-                };
-            }
-            
-            // Handle file selection - core function that processes selected files
-            window.handleFileSelection = function(event) {
-                console.log("handleFileSelection called");
-                const files = event.target.files;
-                
-                if (!files || files.length === 0) {
-                    console.log("No files selected");
-                    resetForm();
-                    return;
-                }
-                
-                console.log(`${files.length} files selected`);
-                
-                if (files.length > MAX_IMAGES) {
-                    alert(`Please select a maximum of ${MAX_IMAGES} images.`);
-                    resetForm();
-                    return;
-                }
-                
-                // Determine mode based on file count
-                isBatchMode = files.length > 1;
-                selectedFiles = Array.from(files);
-                
-                if (isBatchMode) {
-                    // Batch mode - show multiple previews
-                    console.log("Batch mode activated");
-                    singlePreview.classList.add('hidden');
-                    batchPreviewsContainer.classList.remove('hidden');
-                    batchPreviewsContainer.innerHTML = '';
-                    
-                    // Create preview for each image
-                    selectedFiles.forEach((file, index) => {
-                        const reader = new FileReader();
-                        
-                        reader.onload = function(e) {
-                            // Create preview container
-                            const previewDiv = document.createElement('div');
-                            previewDiv.className = 'preview-item';
-                            previewDiv.dataset.index = index;
-                            
-                            // Create image preview
-                            const img = document.createElement('img');
-                            img.src = e.target.result;
-                            img.className = 'preview-img';
-                            
-                            // Create remove button
-                            const removeBtn = document.createElement('div');
-                            removeBtn.className = 'remove-btn';
-                            removeBtn.innerHTML = '×';
-                            removeBtn.onclick = function() {
-                                // Remove this file
-                                selectedFiles.splice(index, 1);
-                                
-                                // Update UI
-                                if (selectedFiles.length === 0) {
-                                    resetForm();
-                                } else if (selectedFiles.length === 1) {
-                                    // Switch to single mode
-                                    isBatchMode = false;
-                                    showSinglePreview(selectedFiles[0]);
-                                } else {
-                                    // Stay in batch mode but update
-                                    updateBatchPreviews();
-                                }
-                            };
-                            
-                            // Add elements
-                            previewDiv.appendChild(img);
-                            previewDiv.appendChild(removeBtn);
-                            batchPreviewsContainer.appendChild(previewDiv);
-                        };
-                        
-                        reader.readAsDataURL(file);
-                    });
-                    
-                    // Update count display
-                    imageCountElem.textContent = `${selectedFiles.length} images selected`;
-                    countDisplay.classList.remove('hidden');
-                } else {
-                    // Single mode - show one preview
-                    console.log("Single image mode activated");
-                    showSinglePreview(selectedFiles[0]);
-                }
-                
-                // Enable classify button - with visual feedback
-                if (classifyButton) {
-                    classifyButton.disabled = false;
-                    classifyButton.classList.remove('opacity-50');
-                    classifyButton.classList.add('hover:bg-primary-focus');
-                    console.log("Classify button enabled");
-                } else {
-                    console.error("Critical Error: Classify button not found");
-                }
-            };
-            
-            // Show single image preview
-            function showSinglePreview(file) {
-                console.log("Showing single preview for file:", file.name);
-                const reader = new FileReader();
-                
-                reader.onload = function(e) {
-                    singlePreview.src = e.target.result;
-                    singlePreview.classList.remove('hidden');
-                    batchPreviewsContainer.classList.add('hidden');
-                    countDisplay.classList.add('hidden');
-                };
-                
-                reader.readAsDataURL(file);
-            }
-            
-            // Update batch previews
-            function updateBatchPreviews() {
-                console.log("Updating batch previews, count:", selectedFiles.length);
-                batchPreviewsContainer.innerHTML = '';
-                
-                selectedFiles.forEach((file, index) => {
-                    const reader = new FileReader();
-                    
-                    reader.onload = function(e) {
-                        // Create preview container
-                        const previewDiv = document.createElement('div');
-                        previewDiv.className = 'preview-item';
-                        previewDiv.dataset.index = index;
-                        
-                        // Create image preview
-                        const img = document.createElement('img');
-                        img.src = e.target.result;
-                        img.className = 'preview-img';
-                        
-                        // Create remove button
-                        const removeBtn = document.createElement('div');
-                        removeBtn.className = 'remove-btn';
-                        removeBtn.innerHTML = '×';
-                        removeBtn.onclick = function() {
-                            // Remove this file
-                            selectedFiles.splice(index, 1);
-                            
-                            // Update UI
-                            if (selectedFiles.length === 0) {
-                                resetForm();
-                            } else if (selectedFiles.length === 1) {
-                                // Switch to single mode
-                                isBatchMode = false;
-                                showSinglePreview(selectedFiles[0]);
-                            } else {
-                                // Stay in batch mode but update
-                                updateBatchPreviews();
-                            }
-                        };
-                        
-                        // Add elements
-                        previewDiv.appendChild(img);
-                        previewDiv.appendChild(removeBtn);
-                        batchPreviewsContainer.appendChild(previewDiv);
-                    };
-                    
-                    reader.readAsDataURL(file);
-                });
-                
-                // Update count
-                imageCountElem.textContent = `${selectedFiles.length} images selected`;
-                countDisplay.classList.remove('hidden');
-            }
-            
-            // Reset the form to initial state
-            function resetForm() {
-                console.log("Resetting form");
-                imageInput.value = '';
-                singlePreview.src = '';
-                singlePreview.classList.add('hidden');
-                batchPreviewsContainer.innerHTML = '';
-                batchPreviewsContainer.classList.add('hidden');
-                countDisplay.classList.add('hidden');
-                
-                // Reset button with visual indicators
-                if (classifyButton) {
-                    classifyButton.disabled = true;
-                    classifyButton.classList.add('opacity-50');
-                    classifyButton.classList.remove('hover:bg-primary-focus');
-                }
-                
-                selectedFiles = [];
-                isBatchMode = false;
-            }
-            
-            // Handle classify button click
-            if (classifyButton) {
-                classifyButton.addEventListener('click', function() {
-                    console.log("Classify button clicked");
-                    
-                    // Show loading state
-                    loadingIndicator.classList.remove('hidden');
-                    resultsPlaceholder.classList.add('hidden');
-                    resultsContent.classList.add('hidden');
-                    resultActions.classList.add('hidden');
-                    ragContextSection.classList.add('hidden'); // Hide RAG context section
-                    classifyButton.disabled = true;
-                    classifyButton.classList.add('opacity-50');
-                    
-                    if (isBatchMode) {
-                        // Batch mode - process multiple images
-                        console.log("Processing batch of", selectedFiles.length, "images");
-                        processBatchImages();
-                    } else {
-                        // Single mode - process one image
-                        console.log("Processing single image");
-                        processSingleImage();
-                    }
-                });
-            }
-            
-            // Process a single image
-            function processSingleImage() {
-                console.log("Starting single image processing");
-                
-                // Get the base64 image data
-                const base64Data = singlePreview.src.split(',')[1];
-                
-                // Send request to API
-                fetch('/api/classify', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        image_data: base64Data,
-                        options: getOptions()
-                    })
-                })
-                .then(response => {
-                    console.log("Received API response, status:", response.status);
-                    return response.json();
-                })
-                .then(data => {
-                    // Hide loading indicator
-                    loadingIndicator.classList.add('hidden');
-                    
-                    if (data.error) {
-                        console.error("Error from API:", data.error);
-                        // Show error message
-                        singleResult.innerHTML = `
-                            <div class="alert alert-error">
-                                <span>Error: ${data.error}</span>
-                            </div>
-                        `;
-                        singleResult.classList.remove('hidden');
-                        batchResults.classList.add('hidden');
-                        resultsContent.classList.remove('hidden');
-                        return;
-                    }
-                    
-                    console.log("Classification successful, displaying results");
-                    
-                    // Display the result using the enhanced display function
-                    displaySingleResult(data);
-                    
-                    // Display RAG context if available
-                    displayRagContext(data);
-                    
-                    // Show containers
-                    singleResult.classList.remove('hidden');
-                    batchResults.classList.add('hidden');
-                    resultsContent.classList.remove('hidden');
-                    resultActions.classList.remove('hidden');
-                })
-                .catch(error => {
-                    console.error('Error classifying image:', error);
-                    loadingIndicator.classList.add('hidden');
-                    singleResult.innerHTML = `
-                        <div class="alert alert-error">
-                            <span>Error: Could not process your request. Please try again.</span>
-                        </div>
-                    `;
-                    singleResult.classList.remove('hidden');
-                    batchResults.classList.add('hidden');
-                    resultsContent.classList.remove('hidden');
-                    classifyButton.disabled = false;
-                    classifyButton.classList.remove('opacity-50');
-                });
-            }
-            
-            // Process batch of images
-            function processBatchImages() {
-                console.log("Starting batch image processing");
-                
-                // Create form data for file upload
-                const formData = new FormData();
-                
-                // Add all files
-                selectedFiles.forEach((file, index) => {
-                    formData.append(`image_${index}`, file);
-                    console.log(`Added image_${index} to form data:`, file.name);
-                });
-                
-                // Add options
-                const options = getOptions();
-                formData.append('options', JSON.stringify(options));
-                console.log("Added options to form data:", options);
-                
-                // Send batch request
-                fetch('/classify-batch', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => {
-                    console.log("Received batch API response, status:", response.status);
-                    return response.json();
-                })
-                .then(data => {
-                    // Hide loading indicator
-                    loadingIndicator.classList.add('hidden');
-                    
-                    if (data.error) {
-                        console.error("Error from batch API:", data.error);
-                        // Show error message
-                        batchResults.innerHTML = `
-                            <div class="alert alert-error">
-                                <span>Error: ${data.error}</span>
-                            </div>
-                        `;
-                        singleResult.classList.add('hidden');
-                        batchResults.classList.remove('hidden');
-                        resultsContent.classList.remove('hidden');
-                        return;
-                    }
-                    
-                    console.log("Batch classification successful, displaying results");
-                    
-                    // Save raw response for copy button
-                    rawResponseText = data.raw_response;
-                    
-                    // Display batch results using the enhanced carousel display function
-                    displayBatchCarousel(data);
-                    
-                    // Display RAG context if available
-                    displayRagContext(data);
-                    
-                    // Show result sections
-                    singleResult.classList.add('hidden');
-                    batchResults.classList.remove('hidden');
-                    resultsContent.classList.remove('hidden');
-                    resultActions.classList.remove('hidden');
-                })
-                .catch(error => {
-                    console.error('Error in batch processing:', error);
-                    loadingIndicator.classList.add('hidden');
-                    batchResults.innerHTML = `
-                        <div class="alert alert-error">
-                            <span>Error: Could not process your request. Please try again.</span>
-                        </div>
-                    `;
-                    singleResult.classList.add('hidden');
-                    batchResults.classList.remove('hidden');
-                    resultsContent.classList.remove('hidden');
-                    classifyButton.disabled = false;
-                    classifyButton.classList.remove('opacity-50');
-                });
-            }
-            
-            // Setup copy button
-            if (copyButton) {
-                copyButton.addEventListener('click', function() {
-                    console.log("Copy button clicked");
-                    navigator.clipboard.writeText(rawResponseText);
-                    copyButton.innerHTML = 'Copied!';
-                    setTimeout(() => {
-                        copyButton.innerHTML = 'Copy Results';
-                    }, 2000);
-                });
-            }
-            
-            // Setup new button
-            if (newButton) {
-                newButton.addEventListener('click', function() {
-                    console.log("New classification button clicked");
-                    // Reset form
-                    resetForm();
-                    
-                    // Reset results
-                    resultsPlaceholder.classList.remove('hidden');
-                    resultsContent.classList.add('hidden');
-                    resultActions.classList.add('hidden');
-                    ragContextSection.classList.add('hidden'); // Hide RAG context
-                    singleResult.classList.add('hidden');
-                    batchResults.classList.add('hidden');
-                });
-            }
-            
-            // Display RAG context section
-            function displayRagContext(result) {
-                // Check if we have context data to display
-                if (result.context_source || 
-                    (result.context_paragraphs && result.context_paragraphs.length > 0) ||
-                    (result.top_sources && result.top_sources.length > 0)) {
-                    
-                    let contextHTML = '';
-                    
-                    // Add the source information
-                    if (result.context_source) {
-                        contextHTML += `
-                            <div class="mb-3">
-                                <span class="font-semibold">Source Document:</span>
-                                <span>${result.context_source}</span>
-                            </div>
-                        `;
-                    }
-                    
-                    // Add context paragraphs
-                    if (result.context_paragraphs && result.context_paragraphs.length > 0) {
-                        contextHTML += `
-                            <div class="mb-3">
-                                <div class="font-semibold mb-2">Reference Text:</div>
-                                <div class="text-sm bg-base-300 p-3 rounded-md max-h-40 overflow-y-auto">
-                                    ${result.context_paragraphs[0]}
-                                </div>
-                            </div>
-                        `;
-                        
-                        // If there are more paragraphs, add a collapsible section
-                        if (result.context_paragraphs.length > 1) {
-                            contextHTML += `
-                                <details class="collapse mb-3">
-                                    <summary class="collapse-title font-medium">Additional Reference Texts</summary>
-                                    <div class="collapse-content">
-                            `;
-                            
-                            for (let i = 1; i < result.context_paragraphs.length; i++) {
-                                contextHTML += `
-                                    <div class="mb-2 text-sm bg-base-300 p-3 rounded-md">
-                                        ${result.context_paragraphs[i]}
-                                    </div>
-                                `;
-                            }
-                            
-                            contextHTML += `
-                                    </div>
-                                </details>
-                            `;
-                        }
-                    }
-                    
-                    // Add top sources if available
-                    if (result.top_sources && result.top_sources.length > 0) {
-                        contextHTML += `
-                            <div class="mb-3">
-                                <div class="font-semibold mb-2">Top Reference Sources:</div>
-                                <ul class="list-disc pl-5">
-                        `;
-                        
-                        result.top_sources.forEach(source => {
-                            contextHTML += `
-                                <li>${source.filename || 'Unknown'}, page ${source.page || '?'}</li>
-                            `;
-                        });
-                        
-                        contextHTML += `
-                                </ul>
-                            </div>
-                        `;
-                    }
-                    
-                    // If we have any context to display, show the section
-                    if (contextHTML) {
-                        ragContextDisplay.innerHTML = contextHTML;
-                        ragContextSection.classList.remove('hidden');
-                    }
-                }
-            }
-            
-            // Function to display single classification result with context
-            function displaySingleResult(result) {
-                console.log("Displaying single result:", result.category);
-                const singleResult = document.getElementById('single-result');
-                
-                // Determine confidence class
-                let confidenceClass = 'badge-warning';
-                if (result.confidence === 'High') {
-                    confidenceClass = 'badge-success';
-                } else if (result.confidence === 'Low') {
-                    confidenceClass = 'badge-error';
-                }
-                
-                // Create result HTML
-                let resultHTML = `
-                    <div class="p-4 bg-base-200 rounded-lg mb-4">
-                        <div class="flex justify-between items-center mb-2">
-                            <h3 class="text-lg font-bold">${result.category}</h3>
-                            <span class="badge ${confidenceClass}">Confidence: ${result.confidence}</span>
-                        </div>
-                        <p class="mb-4">${result.description}</p>
-                `;
-                
-                // Add additional details if available
-                const details = result.details;
-                for (const key in details) {
-                    if (key !== 'Main Category' && key !== 'Confidence' && key !== 'Description') {
-                        resultHTML += `
-                            <div class="mb-2">
-                                <span class="font-semibold">${key}:</span>
-                                <span>${details[key]}</span>
-                            </div>
-                        `;
-                    }
-                }
-                
-                resultHTML += `</div>`;
-                
-                // Add feedback controls
-                resultHTML += `
-                    <div class="flex items-center mt-4 mb-4">
-                        <span class="text-sm mr-2">Rate this classification:</span>
-                        <button class="btn btn-outline btn-sm mr-2" id="thumbs-up-button" onclick="provideFeedback('${result.id}', 'positive')">
-                            👍
-                        </button>
-                        <button class="btn btn-outline btn-sm" id="thumbs-down-button" onclick="provideFeedback('${result.id}', 'negative')">
-                            👎
-                        </button>
-                        <span id="feedback-message" class="text-sm ml-4"></span>
-                    </div>
-                `;
-                
-                // Add raw response in collapsible section
-                resultHTML += `
-                    <details class="collapse bg-base-200">
-                        <summary class="collapse-title font-medium">Raw Response</summary>
-                        <div class="collapse-content">
-                            <pre class="text-xs whitespace-pre-wrap">${result.raw_response}</pre>
-                        </div>
-                    </details>
-                `;
-                
-                // Update the container
-                singleResult.innerHTML = resultHTML;
-                
-                // Save raw response for copy button
-                rawResponseText = result.raw_response;
-            }
-            
-            // Function to display batch results as a DaisyUI carousel
-            function displayBatchCarousel(batchResult) {
-                console.log("Displaying batch carousel for", batchResult.results.length, "images");
-                const batchResultsContainer = document.getElementById('batch-results');
-                
-                // Clear the container
-                batchResultsContainer.innerHTML = '';
-                
-                // Create carousel slides
-                batchResult.results.forEach((result, index) => {
-                    // Determine confidence class
-                    let confidenceClass = 'badge-warning';
-                    if (result.confidence === 'High') {
-                        confidenceClass = 'badge-success';
-                    } else if (result.confidence === 'Low') {
-                        confidenceClass = 'badge-error';
-                    }
-                    
-                    // Create a unique ID for the slide
-                    const slideId = `slide-${index + 1}`;
-                    
-                    // Create the carousel item - using DaisyUI carousel
-                    const carouselItem = document.createElement('div');
-                    carouselItem.id = slideId;
-                    carouselItem.className = 'carousel-item relative w-full';
-                    
-                    // Create the content for this slide
-                    carouselItem.innerHTML = `
-                        <div class="w-full px-4 py-6 bg-base-200 rounded-lg flex flex-col items-center">
-                            <div class="w-full max-w-3xl mx-auto">
-                                <div class="flex justify-between items-center mb-4">
-                                    <h3 class="text-lg font-medium">Result ${index + 1} of ${batchResult.results.length}</h3>
-                                    <span class="badge ${confidenceClass}">Confidence: ${result.confidence}</span>
-                                </div>
-                                
-                                <h4 class="text-xl font-bold mb-2">${result.category}</h4>
-                                <p class="mb-4">${result.description}</p>
-                                
-                                <!-- Additional details if available -->
-                                <div class="mb-4">
-                                    ${Object.entries(result.details || {})
-                                        .filter(([key]) => !['Main Category', 'Confidence', 'Description'].includes(key))
-                                        .map(([key, value]) => `
-                                            <div class="mb-2">
-                                                <span class="font-semibold">${key}:</span>
-                                                <span>${value}</span>
-                                            </div>
-                                        `).join('')
-                                    }
-                                </div>
-                                
-                                <!-- Feedback buttons -->
-                                <div class="flex items-center mt-4">
-                                    <span class="text-sm mr-2">Rate this classification:</span>
-                                    <button class="btn btn-outline btn-sm mr-2" id="thumbs-up-button-${index}" onclick="provideFeedback('${result.id}', 'positive', 'thumbs-up-button-${index}', 'thumbs-down-button-${index}', 'feedback-message-${index}')">
-                                        👍
-                                    </button>
-                                    <button class="btn btn-outline btn-sm" id="thumbs-down-button-${index}" onclick="provideFeedback('${result.id}', 'negative', 'thumbs-up-button-${index}', 'thumbs-down-button-${index}', 'feedback-message-${index}')">
-                                        👎
-                                    </button>
-                                    <span id="feedback-message-${index}" class="text-sm ml-4"></span>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Carousel navigation buttons -->
-                        <div class="absolute left-5 right-5 top-1/2 flex -translate-y-1/2 transform justify-between">
-                            <a href="#slide-${index === 0 ? batchResult.results.length : index}" class="btn btn-circle">❮</a>
-                            <a href="#slide-${index === batchResult.results.length - 1 ? 1 : index + 2}" class="btn btn-circle">❯</a>
-                        </div>
-                    `;
-                    
-                    // Add this slide to the carousel
-                    batchResultsContainer.appendChild(carouselItem);
-                });
-                
-                // Add carousel indicators at the bottom
-                const indicatorsContainer = document.createElement('div');
-                indicatorsContainer.className = 'flex justify-center w-full py-2 gap-2 mt-4';
-                
-                batchResult.results.forEach((_, index) => {
-                    const btnIndicator = document.createElement('a');
-                    btnIndicator.href = `#slide-${index + 1}`;
-                    btnIndicator.className = 'btn btn-xs';
-                    btnIndicator.textContent = (index + 1).toString();
-                    indicatorsContainer.appendChild(btnIndicator);
-                });
-                
-                batchResultsContainer.appendChild(indicatorsContainer);
-                
-                // Show the carousel
-                batchResultsContainer.classList.remove('hidden');
-                
-                // Save raw response for copy button
-                rawResponseText = batchResult.raw_response;
-            }
-            
-            // Global function for providing feedback
-            window.provideFeedback = function(resultId, feedbackType, upButtonId, downButtonId, messageId) {
-                console.log("Providing feedback:", feedbackType, "for result:", resultId);
-                
-                // Get button elements
-                const upButton = document.getElementById(upButtonId || 'thumbs-up-button');
-                const downButton = document.getElementById(downButtonId || 'thumbs-down-button');
-                const messageElement = document.getElementById(messageId || 'feedback-message');
-                
-                if (!upButton || !downButton) {
-                    console.error("Feedback buttons not found");
-                    return;
-                }
-                
-                // Update button UI state
-                if (feedbackType === 'positive') {
-                    upButton.classList.add('btn-success', 'btn-active');
-                    downButton.classList.remove('btn-error', 'btn-active');
-                } else {
-                    upButton.classList.remove('btn-success', 'btn-active');
-                    downButton.classList.add('btn-error', 'btn-active');
-                }
-                
-                // Show sending message
-                if (messageElement) {
-                    messageElement.textContent = 'Saving feedback...';
-                }
-                
-                // Send feedback to server
-                fetch('/api/feedback', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        id: resultId,
-                        feedback: feedbackType
-                    })
-                })
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Failed to save feedback');
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    console.log('Feedback saved successfully:', data);
-                    if (messageElement) {
-                        messageElement.textContent = 'Feedback saved!';
-                        
-                        // Clear message after a delay
-                        setTimeout(() => {
-                            messageElement.textContent = '';
-                        }, 3000);
-                    }
-                })
-                .catch(error => {
-                    console.error('Error saving feedback:', error);
-                    if (messageElement) {
-                        messageElement.textContent = 'Error saving feedback.';
-                    }
-                    
-                    // Reset buttons 
-                    upButton.classList.remove('btn-success', 'btn-active');
-                    downButton.classList.remove('btn-error', 'btn-active');
-                });
-            };
-        });
-        """)
-        
-        # Add enhanced styles for the carousel and RAG context display
-        enhanced_styles = Style("""
-        /* DaisyUI carousel improvements */
-        .carousel {
-            background: var(--color-base-200);
-            border-radius: 0.5rem;
-        }
-        
-        .carousel-item {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-        
-        /* Batch previews styling */
-        .batch-previews {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin: 15px 0;
-        }
-        
-        .preview-item {
-            position: relative;
-            width: 80px;
-            height: 80px;
-        }
-        
-        .preview-img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            border-radius: 0.5rem;
-            border: 2px solid var(--color-base-300);
-        }
-        
-        .remove-btn {
-            position: absolute;
-            top: -8px;
-            right: -8px;
-            background: var(--color-error);
-            color: white;
-            border-radius: 50%;
-            width: 20px;
-            height: 20px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 14px;
-            cursor: pointer;
-        }
-        
-        /* RAG context styling */
-        #rag-context-display {
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        
-        /* Responsive layout */
-        @media (min-width: 768px) {
-            #results-content, #rag-context-section {
-                max-height: none;
-                overflow-y: visible;
-            }
-        }
-        """)
-        
         return Title("Insect Classifier"), Main(
-            form_script,
-            enhanced_styles,
             Div(
                 H1("Insect Classification App", cls="text-3xl font-bold text-center mb-2 text-bee-green"),
                 P("Powered by Claude's Vision AI with RAG", cls="text-center mb-8 text-base-content/70"),
@@ -4915,9 +4913,9 @@ def serve():
             cls="min-h-screen bg-base-100",
             data_theme="light"
         )
-    
-    # Return the FastHTML app
+            # Return the FastHTML app
     return fasthtml_app
+
 
 # When running locally
 if __name__ == "__main__":
