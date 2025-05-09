@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxx"
+CLAUDE_API_KEY = "sk-xxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -4507,6 +4507,83 @@ def serve():
                 console.error("Critical Error: Image input element not found");
             }
             
+            // NEW FUNCTION: Helper to compress image below 5MB limit for Claude API
+            async function compressImage(base64Data) {
+                return new Promise((resolve) => {
+                    // Create an image to load the base64 data
+                    const img = new Image();
+                    img.onload = function() {
+                        let quality = 0.9; // Start with high quality
+                        let maxWidth = img.width;
+                        let maxHeight = img.height;
+                        
+                        // If dimensions are very large, scale down first
+                        const MAX_DIMENSION = 2048; // Reasonable max size
+                        if (img.width > MAX_DIMENSION || img.height > MAX_DIMENSION) {
+                            const scale = Math.min(MAX_DIMENSION / img.width, MAX_DIMENSION / img.height);
+                            maxWidth = Math.floor(img.width * scale);
+                            maxHeight = Math.floor(img.height * scale);
+                            console.log(`Scaling image from ${img.width}x${img.height} to ${maxWidth}x${maxHeight}`);
+                        }
+                        
+                        // Create canvas for resizing/compression
+                        const canvas = document.createElement('canvas');
+                        canvas.width = maxWidth;
+                        canvas.height = maxHeight;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, maxWidth, maxHeight);
+                        
+                        // Try with initial quality
+                        let result = canvas.toDataURL('image/jpeg', quality);
+                        
+                        // Check if the result is smaller than 5MB
+                        const estimateSizeInBytes = Math.ceil((result.length - 22) * 3 / 4); // base64 size estimate
+                        console.log(`Compressed image size estimate: ${Math.round(estimateSizeInBytes/1024/1024*100)/100}MB with quality ${quality}`);
+                        
+                        // If still too large, reduce quality until it fits
+                        if (estimateSizeInBytes > 5 * 1024 * 1024) {
+                            // Try progressively lower qualities
+                            const qualities = [0.8, 0.7, 0.6, 0.5, 0.4, 0.3];
+                            for (const q of qualities) {
+                                result = canvas.toDataURL('image/jpeg', q);
+                                const newSize = Math.ceil((result.length - 22) * 3 / 4);
+                                console.log(`Trying quality ${q}: ${Math.round(newSize/1024/1024*100)/100}MB`);
+                                
+                                if (newSize <= 5 * 1024 * 1024) {
+                                    console.log(`Found acceptable quality: ${q}`);
+                                    break;
+                                }
+                                
+                                // If we're at the lowest quality and still too large, reduce dimensions
+                                if (q === qualities[qualities.length - 1] && newSize > 5 * 1024 * 1024) {
+                                    console.log('Reducing dimensions further');
+                                    maxWidth = Math.floor(maxWidth * 0.7);
+                                    maxHeight = Math.floor(maxHeight * 0.7);
+                                    canvas.width = maxWidth;
+                                    canvas.height = maxHeight;
+                                    ctx.drawImage(img, 0, 0, maxWidth, maxHeight);
+                                    result = canvas.toDataURL('image/jpeg', q);
+                                }
+                            }
+                        }
+                        
+                        // Extract base64 data
+                        const base64 = result.split(',')[1];
+                        resolve(base64);
+                    };
+                    
+                    // Handle image loading error
+                    img.onerror = function() {
+                        console.error('Error loading image for compression');
+                        // Return original data if compression fails
+                        resolve(base64Data.split(',')[1]);
+                    };
+                    
+                    // Set image source to the original base64 data
+                    img.src = base64Data.includes('data:') ? base64Data : 'data:image/jpeg;base64,' + base64Data;
+                });
+            }
+            
             // Get options from the form controls - always include all processing steps
             function getOptions() {
                 return {
@@ -4761,80 +4838,103 @@ def serve():
             }
             
             // Process a single image
-            function processSingleImage() {
+            async function processSingleImage() {
                 console.log("Starting single image processing");
                 
-                // Get the base64 image data
-                const base64Data = singlePreview.src.split(',')[1];
-                
-                // Send request to API
-                fetch('/api/classify', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        image_data: base64Data,
-                        options: getOptions()
-                    })
-                })
-                .then(response => {
-                    console.log("Received API response, status:", response.status);
-                    return response.json();
-                })
-                .then(data => {
-                    // Hide loading indicator
-                    loadingIndicator.classList.add('hidden');
+                try {
+                    // Get the base64 image data
+                    const base64Data = singlePreview.src;
                     
-                    if (data.error) {
-                        console.error("Error from API:", data.error);
-                        // Show error message
+                    // Compress image before sending to API
+                    console.log("Compressing image for API submission...");
+                    const compressedImageData = await compressImage(base64Data);
+                    console.log("Image compression complete");
+                    
+                    // Send request to API
+                    fetch('/api/classify', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            image_data: compressedImageData,
+                            options: getOptions()
+                        })
+                    })
+                    .then(response => {
+                        console.log("Received API response, status:", response.status);
+                        return response.json();
+                    })
+                    .then(data => {
+                        // Hide loading indicator
+                        loadingIndicator.classList.add('hidden');
+                        
+                        if (data.error) {
+                            console.error("Error from API:", data.error);
+                            // Show error message
+                            singleResult.innerHTML = `
+                                <div class="alert alert-error">
+                                    <span>Error: ${data.error}</span>
+                                </div>
+                            `;
+                            singleResult.classList.remove('hidden');
+                            batchResults.classList.add('hidden');
+                            resultsContent.classList.remove('hidden');
+                            return;
+                        }
+                        
+                        console.log("Classification successful, displaying results");
+                        
+                        // Update steps UI based on result content
+                        updateStepsUI('classify'); // Initial classification always done
+                        
+                        // Check if plant identification is included
+                        if (data.details && 
+                        (data.details["Plant Identification"] || 
+                            data.details["Detailed Description"])) {
+                            updateStepsUI('plants');
+                            
+                            // Check if taxonomy is included
+                            if (data.details && data.details["Taxonomy"]) {
+                                updateStepsUI('taxonomy');
+                            }
+                        }
+                        
+                        // Display the result using the enhanced display function
+                        displaySingleResult(data);
+                        
+                        // Display RAG context if available
+                        displayRagContext(data);
+                        
+                        // Show containers
+                        singleResult.classList.remove('hidden');
+                        batchResults.classList.add('hidden');
+                        resultsContent.classList.remove('hidden');
+                        resultActions.classList.remove('hidden');
+                    })
+                    .catch(error => {
+                        console.error('Error classifying image:', error);
+                        loadingIndicator.classList.add('hidden');
                         singleResult.innerHTML = `
                             <div class="alert alert-error">
-                                <span>Error: ${data.error}</span>
+                                <span>Error: Could not process your request. Please try again.</span>
                             </div>
                         `;
                         singleResult.classList.remove('hidden');
                         batchResults.classList.add('hidden');
                         resultsContent.classList.remove('hidden');
-                        return;
-                    }
-                    
-                    console.log("Classification successful, displaying results");
-                    
-                    // Update steps UI based on result content
-                    updateStepsUI('classify'); // Initial classification always done
-                    
-                    // Check if plant identification is included
-                    if (data.details && 
-                    (data.details["Plant Identification"] || 
-                        data.details["Detailed Description"])) {
-                        updateStepsUI('plants');
+                        classifyButton.disabled = false;
+                        classifyButton.classList.remove('opacity-50');
                         
-                        // Check if taxonomy is included
-                        if (data.details && data.details["Taxonomy"]) {
-                            updateStepsUI('taxonomy');
-                        }
-                    }
-                    
-                    // Display the result using the enhanced display function
-                    displaySingleResult(data);
-                    
-                    // Display RAG context if available
-                    displayRagContext(data);
-                    
-                    // Show containers
-                    singleResult.classList.remove('hidden');
-                    batchResults.classList.add('hidden');
-                    resultsContent.classList.remove('hidden');
-                    resultActions.classList.remove('hidden');
-                })
-                .catch(error => {
-                    console.error('Error classifying image:', error);
+                        // Reset steps UI
+                        updateStepsUI(null);
+                    });
+                } catch (error) {
+                    console.error('Error preparing image for classification:', error);
                     loadingIndicator.classList.add('hidden');
                     singleResult.innerHTML = `
                         <div class="alert alert-error">
-                            <span>Error: Could not process your request. Please try again.</span>
+                            <span>Error: Could not prepare image for processing. Please try a different image.</span>
                         </div>
                     `;
                     singleResult.classList.remove('hidden');
@@ -4845,80 +4945,126 @@ def serve():
                     
                     // Reset steps UI
                     updateStepsUI(null);
-                });
+                }
             }
             
             // Process batch of images
-            function processBatchImages() {
+            async function processBatchImages() {
                 console.log("Starting batch image processing");
                 
-                // Create form data for file upload
-                const formData = new FormData();
-                
-                // Add all files
-                selectedFiles.forEach((file, index) => {
-                    formData.append(`image_${index}`, file);
-                    console.log(`Added image_${index} to form data:`, file.name);
-                });
-                
-                // Add options
-                const options = getOptions();
-                formData.append('options', JSON.stringify(options));
-                console.log("Added options to form data:", options);
-                
-                // Send batch request
-                fetch('/classify-batch', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => {
-                    console.log("Received batch API response, status:", response.status);
-                    return response.json();
-                })
-                .then(data => {
-                    // Hide loading indicator
-                    loadingIndicator.classList.add('hidden');
+                try {
+                    // Create form data for file upload
+                    const formData = new FormData();
                     
-                    if (data.error) {
-                        console.error("Error from batch API:", data.error);
-                        // Show error message
+                    // Add compressed versions of files
+                    for (let i = 0; i < selectedFiles.length; i++) {
+                        const file = selectedFiles[i];
+                        
+                        // Read the file
+                        const fileReader = new FileReader();
+                        const fileDataPromise = new Promise((resolve) => {
+                            fileReader.onload = (e) => resolve(e.target.result);
+                            fileReader.readAsDataURL(file);
+                        });
+                        
+                        const fileData = await fileDataPromise;
+                        
+                        // Compress the image
+                        console.log(`Compressing image ${i+1}/${selectedFiles.length}...`);
+                        const compressedData = await compressImage(fileData);
+                        
+                        // Convert base64 back to Blob
+                        const byteCharacters = atob(compressedData);
+                        const byteNumbers = new Array(byteCharacters.length);
+                        for (let j = 0; j < byteCharacters.length; j++) {
+                            byteNumbers[j] = byteCharacters.charCodeAt(j);
+                        }
+                        const byteArray = new Uint8Array(byteNumbers);
+                        const blob = new Blob([byteArray], { type: 'image/jpeg' });
+                        
+                        // Create a new file from the blob
+                        const compressedFile = new File([blob], file.name, { type: 'image/jpeg' });
+                        
+                        // Add to form data
+                        formData.append(`image_${i}`, compressedFile);
+                        console.log(`Added compressed image_${i} to form data:`, compressedFile.name, `(${Math.round(compressedFile.size/1024)}KB)`);
+                    }
+                    
+                    // Add options
+                    const options = getOptions();
+                    formData.append('options', JSON.stringify(options));
+                    console.log("Added options to form data:", options);
+                    
+                    // Send batch request
+                    fetch('/classify-batch', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => {
+                        console.log("Received batch API response, status:", response.status);
+                        return response.json();
+                    })
+                    .then(data => {
+                        // Hide loading indicator
+                        loadingIndicator.classList.add('hidden');
+                        
+                        if (data.error) {
+                            console.error("Error from batch API:", data.error);
+                            // Show error message
+                            batchResults.innerHTML = `
+                                <div class="alert alert-error">
+                                    <span>Error: ${data.error}</span>
+                                </div>
+                            `;
+                            singleResult.classList.add('hidden');
+                            batchResults.classList.remove('hidden');
+                            resultsContent.classList.remove('hidden');
+                            return;
+                        }
+                        
+                        console.log("Batch classification successful, displaying results");
+                        
+                        // Update steps UI with final state
+                        updateStepsUI('taxonomy'); // For batch, assume all steps completed
+                        
+                        // Save raw response for copy button
+                        rawResponseText = data.raw_response;
+                        
+                        // Display batch results using the enhanced carousel display function
+                        displayBatchCarousel(data);
+                        
+                        // Display RAG context if available
+                        displayRagContext(data);
+                        
+                        // Show result sections
+                        singleResult.classList.add('hidden');
+                        batchResults.classList.remove('hidden');
+                        resultsContent.classList.remove('hidden');
+                        resultActions.classList.remove('hidden');
+                    })
+                    .catch(error => {
+                        console.error('Error in batch processing:', error);
+                        loadingIndicator.classList.add('hidden');
                         batchResults.innerHTML = `
                             <div class="alert alert-error">
-                                <span>Error: ${data.error}</span>
+                                <span>Error: Could not process your request. Please try again.</span>
                             </div>
                         `;
                         singleResult.classList.add('hidden');
                         batchResults.classList.remove('hidden');
                         resultsContent.classList.remove('hidden');
-                        return;
-                    }
-                    
-                    console.log("Batch classification successful, displaying results");
-                    
-                    // Update steps UI with final state
-                    updateStepsUI('taxonomy'); // For batch, assume all steps completed
-                    
-                    // Save raw response for copy button
-                    rawResponseText = data.raw_response;
-                    
-                    // Display batch results using the enhanced carousel display function
-                    displayBatchCarousel(data);
-                    
-                    // Display RAG context if available
-                    displayRagContext(data);
-                    
-                    // Show result sections
-                    singleResult.classList.add('hidden');
-                    batchResults.classList.remove('hidden');
-                    resultsContent.classList.remove('hidden');
-                    resultActions.classList.remove('hidden');
-                })
-                .catch(error => {
-                    console.error('Error in batch processing:', error);
+                        classifyButton.disabled = false;
+                        classifyButton.classList.remove('opacity-50');
+                        
+                        // Reset steps UI
+                        updateStepsUI(null);
+                    });
+                } catch (error) {
+                    console.error('Error preparing batch images:', error);
                     loadingIndicator.classList.add('hidden');
                     batchResults.innerHTML = `
                         <div class="alert alert-error">
-                            <span>Error: Could not process your request. Please try again.</span>
+                            <span>Error: Could not prepare images for processing. Please try different images.</span>
                         </div>
                     `;
                     singleResult.classList.add('hidden');
@@ -4929,7 +5075,7 @@ def serve():
                     
                     // Reset steps UI
                     updateStepsUI(null);
-                });
+                }
             }
             
             // Setup copy button
@@ -4978,6 +5124,39 @@ def serve():
                                 <span>${result.context_source}</span>
                             </div>
                         `;
+                    }
+                    
+                    // NEW ADDITION: Display context image if available
+                    if (result.context_image_used && result.top_sources && result.top_sources.length > 0) {
+                        const topSource = result.top_sources[0];
+                        if (topSource) {
+                            let imageUrl;
+                            
+                            // Try to get image path from top_sources
+                            if (topSource.image_path) {
+                                imageUrl = `/image-thumbnail?path=${encodeURIComponent(topSource.image_path)}`;
+                            } else {
+                                // Fall back to constructing a URL from filename and page
+                                const filename = topSource.filename || '';
+                                const page = topSource.page || '0';
+                                imageUrl = `/context-image?filename=${encodeURIComponent(filename)}&page=${page}`;
+                            }
+                            
+                            contextHTML += `
+                                <div class="mb-4">
+                                    <div class="font-semibold mb-2">Reference Document:</div>
+                                    <div class="flex justify-center">
+                                        <img 
+                                            src="${imageUrl}" 
+                                            alt="Context Document"
+                                            class="max-h-72 object-contain rounded-lg border border-base-300 shadow-sm cursor-pointer"
+                                            onclick="window.open('${imageUrl}&full=true', '_blank')"
+                                            title="Click to view full size"
+                                        />
+                                    </div>
+                                </div>
+                            `;
+                        }
                     }
                     
                     // Add context paragraphs
@@ -5173,6 +5352,14 @@ def serve():
                                     </button>
                                     <span id="feedback-message-${index}" class="text-sm ml-4"></span>
                                 </div>
+                                
+                                <!-- Add Raw Response section - NEW ADDITION -->
+                                <details class="collapse bg-base-100 mt-4">
+                                    <summary class="collapse-title font-medium">Raw Response</summary>
+                                    <div class="collapse-content">
+                                        <pre class="text-xs whitespace-pre-wrap">${result.raw_response || (index === 0 ? batchResult.raw_response : 'No individual raw response available')}</pre>
+                                    </div>
+                                </details>
                             </div>
                         </div>
                         
