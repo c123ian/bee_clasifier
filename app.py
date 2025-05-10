@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -1350,6 +1350,331 @@ def get_trend_indicator(stats):
         "html": html
     }
 
+def build_network_visualization(stats):
+    """Create the network visualization component for the dashboard"""
+    return Div(
+        H2("Plant-Insect Relationship Network", cls="text-xl font-bold mb-4 text-bee-green"),
+        P("Explore connections between classified insects and plants in the ecosystem", cls="mb-4"),
+        
+        # Controls
+        Div(
+            Select(
+                Option("All classified insects", value=""),
+                *[
+                    Option(category, value=category)
+                    for category, _ in stats["category_counts"]
+                ],
+                cls="select select-bordered w-full max-w-xs",
+                hx_get="/api/insect-network",
+                hx_trigger="change",
+                hx_target="#network-container",
+                hx_indicator="#network-loading"
+            ),
+            
+            Button(
+                "Refresh Network",
+                cls="btn btn-sm",
+                hx_get="/api/insect-network",
+                hx_trigger="click",
+                hx_target="#network-container",
+                hx_indicator="#network-loading"
+            ),
+            
+            cls="flex flex-wrap gap-2 mb-4"
+        ),
+        
+        # Network visualization container
+        Div(
+            Div(id="network-svg", cls="w-full h-[450px]"),
+            
+            # Legend
+            Div(
+                Div(
+                    Span(cls="w-3 h-3 inline-block mr-1 rounded-full bg-warning"),
+                    Span("Insects"),
+                    cls="flex items-center mb-1"
+                ),
+                Div(
+                    Span(cls="w-3 h-3 inline-block mr-1 rounded-full bg-success"),
+                    Span("Plants"),
+                    cls="flex items-center"
+                ),
+                cls="absolute bottom-2 right-2 bg-base-100 p-2 rounded-lg shadow-sm text-xs"
+            ),
+            
+            # Loading indicator
+            Div(
+                Span(cls="loading loading-spinner loading-lg text-primary"),
+                id="network-loading",
+                cls="htmx-indicator absolute inset-0 flex items-center justify-center bg-base-100 bg-opacity-70"
+            ),
+            
+            id="network-container",
+            cls="relative bg-base-200 p-4 rounded-lg min-h-[450px]"
+        ),
+        
+        # Relationship details panel
+        Div(
+            P("Hover over connections in the network to see relationship details", 
+              cls="text-center text-base-content/50 italic"),
+            id="relationship-details",
+            cls="mt-4 bg-base-200 p-4 rounded-lg"
+        ),
+        
+        # D3.js for visualization
+        Script(src="https://cdn.jsdelivr.net/npm/d3@7"),
+        
+        # Network visualization script
+        Script("""
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize D3.js network visualization
+            setupNetworkVisualization();
+            
+            // Load initial data
+            fetchNetworkData();
+            
+            // Function to set up the network visualization
+            function setupNetworkVisualization() {
+                const svg = d3.select("#network-svg")
+                    .append("svg")
+                    .attr("width", "100%")
+                    .attr("height", "100%");
+                    
+                svg.append("text")
+                    .attr("x", "50%")
+                    .attr("y", "50%")
+                    .attr("text-anchor", "middle")
+                    .text("Loading network data...");
+            }
+            
+            // Function to fetch network data
+            function fetchNetworkData(filter = "") {
+                const url = filter ? `/api/insect-network?insect=${filter}` : '/api/insect-network';
+                
+                fetch(url)
+                    .then(response => response.json())
+                    .then(data => {
+                        updateNetworkVisualization(data);
+                    })
+                    .catch(error => {
+                        console.error('Error fetching network data:', error);
+                        d3.select("#network-svg svg").html("");
+                        d3.select("#network-svg svg")
+                            .append("text")
+                            .attr("x", "50%")
+                            .attr("y", "50%")
+                            .attr("text-anchor", "middle")
+                            .text("Error loading network data. Please try again.");
+                    });
+            }
+            
+            // Function to update the network visualization with new data
+            function updateNetworkVisualization(data) {
+                // Clear the SVG
+                d3.select("#network-svg").html("");
+                
+                // Create new SVG
+                const svg = d3.select("#network-svg")
+                    .append("svg")
+                    .attr("width", "100%")
+                    .attr("height", "100%");
+                    
+                // Check if we have data
+                if (!data.nodes || data.nodes.length === 0) {
+                    svg.append("text")
+                        .attr("x", "50%")
+                        .attr("y", "50%")
+                        .attr("text-anchor", "middle")
+                        .text("No network data available yet. Classify some insects to build the network!");
+                    return;
+                }
+                
+                // Get dimensions
+                const width = svg.node().getBoundingClientRect().width;
+                const height = svg.node().getBoundingClientRect().height;
+                
+                // Create a group for the visualization
+                const g = svg.append("g")
+                    .attr("transform", `translate(${width/2}, ${height/2})`);
+                    
+                // Define node colors by group
+                const color = d3.scaleOrdinal()
+                    .domain(["insect", "plant"])
+                    .range(["#F6AD55", "#68D391"]); // Warning and success colors
+                    
+                // Create a tooltip
+                const tooltip = d3.select("body").append("div")
+                    .attr("class", "tooltip")
+                    .style("position", "absolute")
+                    .style("background-color", "white")
+                    .style("border", "1px solid #ddd")
+                    .style("border-radius", "4px")
+                    .style("padding", "8px")
+                    .style("pointer-events", "none")
+                    .style("opacity", 0);
+                    
+                // Create a force simulation
+                const simulation = d3.forceSimulation(data.nodes)
+                    .force("link", d3.forceLink(data.links).id(d => d.id).distance(100))
+                    .force("charge", d3.forceManyBody().strength(-300))
+                    .force("center", d3.forceCenter(0, 0))
+                    .force("collision", d3.forceCollide().radius(d => Math.sqrt(d.value) * 2 + 10));
+                    
+                // Define arrow markers for directional links
+                g.append("defs").selectAll("marker")
+                    .data(["pollinates", "feeds_on", "habitat", "interacts"])
+                    .enter().append("marker")
+                    .attr("id", d => `arrow-${d}`)
+                    .attr("viewBox", "0 -5 10 10")
+                    .attr("refX", 20)
+                    .attr("refY", 0)
+                    .attr("markerWidth", 6)
+                    .attr("markerHeight", 6)
+                    .attr("orient", "auto")
+                    .append("path")
+                    .attr("fill", d => d === "pollinates" ? "#F6AD55" : "#68D391")
+                    .attr("d", "M0,-5L10,0L0,5");
+                    
+                // Create the links
+                const link = g.append("g")
+                    .selectAll("path")
+                    .data(data.links)
+                    .enter().append("path")
+                    .attr("stroke", d => d.type === "pollinates" ? "#F6AD55" : "#68D391")
+                    .attr("stroke-opacity", 0.6)
+                    .attr("stroke-width", d => Math.sqrt(d.value))
+                    .attr("marker-end", d => `url(#arrow-${d.type})`)
+                    .attr("fill", "none")
+                    .on("mouseover", function(event, d) {
+                        // Highlight the link
+                        d3.select(this)
+                            .attr("stroke-opacity", 1)
+                            .attr("stroke-width", d => Math.sqrt(d.value) + 2);
+                            
+                        // Show tooltip
+                        tooltip.transition()
+                            .duration(200)
+                            .style("opacity", .9);
+                        tooltip.html(`${d.source.id} ${d.type} ${d.target.id}`)
+                            .style("left", (event.pageX + 10) + "px")
+                            .style("top", (event.pageY - 28) + "px");
+                            
+                        // Fetch relationship details
+                        fetch(`/api/relationship-details?source=${encodeURIComponent(d.source.id)}&target=${encodeURIComponent(d.target.id)}`)
+                            .then(response => response.text())
+                            .then(html => {
+                                document.getElementById('relationship-details').innerHTML = html;
+                            })
+                            .catch(error => {
+                                console.error('Error fetching relationship details:', error);
+                            });
+                    })
+                    .on("mouseout", function() {
+                        d3.select(this)
+                            .attr("stroke-opacity", 0.6)
+                            .attr("stroke-width", d => Math.sqrt(d.value));
+                            
+                        tooltip.transition()
+                            .duration(500)
+                            .style("opacity", 0);
+                    });
+                    
+                // Create the nodes
+                const node = g.append("g")
+                    .selectAll("g")
+                    .data(data.nodes)
+                    .enter().append("g")
+                    .call(d3.drag()
+                        .on("start", dragstarted)
+                        .on("drag", dragged)
+                        .on("end", dragended))
+                    .on("mouseover", function(event, d) {
+                        // Show tooltip
+                        tooltip.transition()
+                            .duration(200)
+                            .style("opacity", .9);
+                        tooltip.html(`${d.id} (${d.group})`)
+                            .style("left", (event.pageX + 10) + "px")
+                            .style("top", (event.pageY - 28) + "px");
+                            
+                        // Highlight connected links
+                        link.attr("stroke-opacity", l => 
+                            l.source.id === d.id || l.target.id === d.id ? 1 : 0.1);
+                    })
+                    .on("mouseout", function() {
+                        tooltip.transition()
+                            .duration(500)
+                            .style("opacity", 0);
+                            
+                        // Reset link highlighting
+                        link.attr("stroke-opacity", 0.6);
+                    });
+                    
+                // Add circles for the nodes
+                node.append("circle")
+                    .attr("r", d => Math.sqrt(d.value))
+                    .attr("fill", d => color(d.group))
+                    .attr("stroke", "#fff")
+                    .attr("stroke-width", 1.5);
+                    
+                // Add labels to the nodes
+                node.append("text")
+                    .text(d => d.id)
+                    .attr("font-size", 10)
+                    .attr("dx", 12)
+                    .attr("dy", ".35em")
+                    .attr("text-anchor", "middle")
+                    .style("pointer-events", "none");
+                    
+                // Update positions in simulation tick
+                simulation.on("tick", () => {
+                    link.attr("d", d => {
+                        const dx = d.target.x - d.source.x;
+                        const dy = d.target.y - d.source.y;
+                        const dr = Math.sqrt(dx * dx + dy * dy);
+                        return `M${d.source.x},${d.source.y}A${dr},${dr} 0 0,1 ${d.target.x},${d.target.y}`;
+                    });
+                    
+                    node.attr("transform", d => `translate(${d.x},${d.y})`);
+                });
+                
+                // Drag functions
+                function dragstarted(event, d) {
+                    if (!event.active) simulation.alphaTarget(0.3).restart();
+                    d.fx = d.x;
+                    d.fy = d.y;
+                }
+                
+                function dragged(event, d) {
+                    d.fx = event.x;
+                    d.fy = event.y;
+                }
+                
+                function dragended(event, d) {
+                    if (!event.active) simulation.alphaTarget(0);
+                    d.fx = null;
+                    d.fy = null;
+                }
+            }
+            
+            // Handle HTMX events
+            document.body.addEventListener('htmx:afterSwap', function(evt) {
+                if (evt.detail.target.id === 'network-container') {
+                    // Parse the JSON from the response
+                    try {
+                        const data = JSON.parse(evt.detail.xhr.response);
+                        updateNetworkVisualization(data);
+                    } catch (e) {
+                        console.error('Error parsing network data:', e);
+                    }
+                }
+            });
+        });
+        """),
+        
+        cls="bg-base-100 p-6 rounded-lg shadow-md border custom-border mb-8"
+    )
+
 def generate_flowbite_table_rows(results):
     """Generate HTML for Flowbite table rows"""
     if not results:
@@ -1452,6 +1777,314 @@ def generate_flowbite_table_rows(results):
     timeout=600,  # Increased timeout
     volumes={DATA_DIR: bee_volume}
 )
+
+# node network func
+
+# Helper function to call Claude API for structured data extraction
+async def call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219"):
+    """Call Claude API to extract structured data"""
+    try:
+        headers = {
+            "x-api-key": CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        }
+        
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        return result["content"][0]["text"]
+        
+    except Exception as e:
+        logging.error(f"Error calling Claude API: {e}")
+        return "[]"  # Return empty JSON array as string on error
+        
+# Build network of insect-plant relationships
+async def build_insect_plant_network(insect_filter=None):
+    """Build network data structure from classified insects and RAG data"""
+    global colpali_embeddings, df, page_images
+    
+    # Initialize network structure
+    nodes = []
+    links = []
+    
+    try:
+        # Connect to the database
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        cursor = conn.cursor()
+        
+        # Get classified insects
+        if insect_filter:
+            cursor.execute(
+                "SELECT DISTINCT category FROM results WHERE category = ?",
+                (insect_filter,)
+            )
+        else:
+            cursor.execute(
+                "SELECT DISTINCT category FROM results"
+            )
+        
+        insect_categories = [row[0] for row in cursor.fetchall()]
+        
+        # For each insect category, find relationships with plants
+        for insect in insect_categories:
+            # Count occurrences of this insect for node sizing
+            cursor.execute(
+                "SELECT COUNT(*) FROM results WHERE category = ?",
+                (insect,)
+            )
+            count = cursor.fetchone()[0]
+            
+            # Add insect node
+            nodes.append({
+                "id": insect,
+                "group": "insect",
+                "value": min(count * 5, 50),  # Scale value by count, max of 50
+                "type": "insect"
+            })
+            
+            # Use RAG to find plant relationships
+            plant_relationships = await find_plant_relationships(insect)
+            
+            # Add plants and relationships to the network
+            for plant_info in plant_relationships:
+                plant_name = plant_info["plant"]
+                
+                # Add plant node if not already in network
+                if not any(node["id"] == plant_name for node in nodes):
+                    nodes.append({
+                        "id": plant_name,
+                        "group": "plant",
+                        "value": plant_info.get("strength", 10),
+                        "type": "plant"
+                    })
+                
+                # Add relationship link
+                links.append({
+                    "source": insect,
+                    "target": plant_name,
+                    "value": plant_info.get("strength", 5),
+                    "type": plant_info.get("relationship_type", "interacts")
+                })
+        
+        conn.close()
+        
+        return {
+            "nodes": nodes,
+            "links": links
+        }
+    except Exception as e:
+        logging.error(f"Error building network data: {e}")
+        traceback.print_exc()
+        return {"nodes": [], "links": []}
+
+# Find plant relationships for an insect using RAG
+async def find_plant_relationships(insect_name):
+    """Use RAG to find plant relationships for an insect species"""
+    relationships = []
+    
+    try:
+        # Construct multiple queries to find different types of relationships
+        queries = [
+            f"What plants do {insect_name} pollinate?",
+            f"What plants do {insect_name} feed on?",
+            f"What plants are important habitats for {insect_name}?"
+        ]
+        
+        # Process each query to find relationships
+        for query in queries:
+            # Use existing RAG retrieval to find relevant context
+            context_images, top_sources = await retrieve_relevant_documents(query, top_k=3)
+            
+            if top_sources and len(top_sources) > 0:
+                # Extract context paragraphs from the documents
+                context_texts = []
+                for source in top_sources:
+                    try:
+                        # Get document content
+                        idx = source.get('idx')
+                        if idx is not None and idx < len(df):
+                            context_texts.append(df.iloc[idx]['text'])
+                    except Exception as e:
+                        logging.error(f"Error getting context text: {e}")
+                
+                if context_texts:
+                    # Use Claude API to extract relationships from context
+                    relationships_from_context = await extract_relationships_from_context(
+                        insect_name, 
+                        query, 
+                        context_texts
+                    )
+                    relationships.extend(relationships_from_context)
+        
+        # Remove duplicates based on plant name
+        unique_plants = {}
+        for rel in relationships:
+            plant_name = rel["plant"]
+            if plant_name not in unique_plants:
+                unique_plants[plant_name] = rel
+            elif rel.get("strength", 0) > unique_plants[plant_name].get("strength", 0):
+                unique_plants[plant_name] = rel
+        
+        return list(unique_plants.values())
+        
+    except Exception as e:
+        logging.error(f"Error finding plant relationships for {insect_name}: {e}")
+        return []
+
+# Extract structured plant relationships from context
+async def extract_relationships_from_context(insect, query, context_texts):
+    """Extract structured plant relationships from context using Claude API"""
+    try:
+        # Combine context texts
+        combined_context = "\n\n".join(context_texts)
+        
+        # Prepare the prompt for Claude
+        prompt = f"""
+        Based on the following context information, identify plants that have a relationship with {insect}.
+        
+        Context:
+        {combined_context}
+        
+        Query: {query}
+        
+        Extract ONLY plant names that have a definite relationship with {insect} based on the context.
+        For each plant, determine:
+        1. The plant name
+        2. The type of relationship (e.g., pollination, food source, habitat)
+        3. The strength of the relationship (1-10, where 10 is strongest)
+        
+        If NO plant relationships are mentioned in the context, return an empty list.
+        
+        Format your response as a JSON array of objects with these properties:
+        [
+          {{
+            "plant": "plant name",
+            "relationship_type": "type of relationship",
+            "strength": number (1-10),
+            "source": "brief mention of where this came from"
+          }}
+        ]
+        
+        ONLY include plants with clear relationships to {insect} from the context.
+        """
+        
+        # Call Claude API
+        response = await call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219")
+        
+        # Parse the response (assumption: response is a JSON array)
+        try:
+            relationships = json.loads(response)
+            if not isinstance(relationships, list):
+                relationships = []
+        except json.JSONDecodeError:
+            logging.error(f"Error parsing JSON from Claude response: {response}")
+            relationships = []
+        
+        return relationships
+        
+    except Exception as e:
+        logging.error(f"Error extracting relationships from context: {e}")
+        return []
+
+# Get detailed relationship information from RAG
+async def get_relationship_from_rag(insect, plant):
+    """Get detailed relationship information from RAG"""
+    try:
+        # Create a specific query about this relationship
+        query = f"What is the relationship between {insect} and {plant}? How do they interact?"
+        
+        # Use the existing RAG retrieval function
+        context_images, top_sources = await retrieve_relevant_documents(query, top_k=2)
+        
+        # Extract context text from sources
+        context_texts = []
+        if top_sources and len(top_sources) > 0:
+            for source in top_sources:
+                try:
+                    # Get document content
+                    idx = source.get('idx')
+                    if idx is not None and idx < len(df):
+                        context_texts.append(df.iloc[idx]['text'])
+                        source_info = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
+                except Exception as e:
+                    logging.error(f"Error getting context text: {e}")
+        
+        if not context_texts:
+            return {
+                "type": "interaction",
+                "description": "No specific information about this relationship was found in the reference materials."
+            }
+        
+        # Combine context texts
+        combined_context = "\n\n".join(context_texts)
+        
+        # Prepare the prompt for Claude
+        prompt = f"""
+        Based on the following context information, describe the relationship between {insect} and {plant}.
+        
+        Context:
+        {combined_context}
+        
+        Extract:
+        1. The type of relationship (e.g., pollination, food source, habitat)
+        2. A detailed description of how these species interact
+        
+        If the context doesn't mention this specific relationship, say that.
+        
+        Format your response as a JSON object with these properties:
+        {{
+          "type": "type of relationship",
+          "description": "detailed description of the relationship",
+          "source": "source of this information from the context"
+        }}
+        """
+        
+        # Call Claude API
+        response = await call_claude_for_structured_data(prompt)
+        
+        # Parse the response
+        try:
+            relationship_data = json.loads(response)
+            if not isinstance(relationship_data, dict):
+                relationship_data = {
+                    "type": "unknown",
+                    "description": "Could not extract relationship details from context."
+                }
+            
+            # Add source information if available
+            if top_sources and len(top_sources) > 0:
+                source = top_sources[0]
+                relationship_data["source"] = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
+                
+        except json.JSONDecodeError:
+            logging.error(f"Error parsing JSON from Claude response: {response}")
+            relationship_data = {
+                "type": "unknown",
+                "description": "Could not extract relationship details from context."
+            }
+        
+        return relationship_data
+        
+    except Exception as e:
+        logging.error(f"Error getting relationship details: {e}")
+        return {
+            "type": "unknown",
+            "description": f"Error retrieving relationship information: {str(e)}"
+        }
+        
 def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
     """
     Classify insect in image using Claude's API with RAG context
@@ -2486,6 +3119,57 @@ def serve():
             return JSONResponse({"error": str(e)}, status_code=500)
     
     # Additional API routes for feedback, charts, etc.
+
+    @rt("/api/insect-network")
+    async def get_insect_network(request):
+        """Get network data for insects and their plant relationships"""
+        try:
+            # Get query parameter for specific insect if provided
+            insect_filter = request.query_params.get("insect", None)
+            
+            # Build network data based on classified insects and RAG
+            network_data = await build_insect_plant_network(insect_filter)
+            
+            # Return as JSON
+            return JSONResponse(network_data)
+        except Exception as e:
+            logging.error(f"Error generating network: {e}")
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @rt("/api/relationship-details")
+    async def get_relationship_details(request):
+        """Get details about a specific insect-plant relationship"""
+        try:
+            # Get parameters
+            source = request.query_params.get("source")
+            target = request.query_params.get("target")
+            
+            if not source or not target:
+                return HTMLResponse("<p>Select a relationship to view details</p>")
+            
+            # Get relationship details from RAG
+            details = await get_relationship_from_rag(source, target)
+            
+            # Return HTML fragment for HTMX
+            return HTMLResponse(f"""
+                <div class="bg-accent text-accent-content p-4 rounded-lg">
+                    <h3 class="font-bold text-lg">{source} → {target}</h3>
+                    <div class="text-sm italic mb-3">
+                        Relationship: {details.get('type', 'interaction')}
+                    </div>
+                    <p>{details.get('description', 'No detailed information available.')}</p>
+                    {f'<p class="text-xs mt-2">Source: {details["source"]}</p>' if details.get('source') else ''}
+                </div>
+            """)
+        except Exception as e:
+            logging.error(f"Error getting relationship details: {e}")
+            return HTMLResponse(f"""
+                <div class="bg-error text-error-content p-4 rounded-lg">
+                    <p>Error loading relationship details: {str(e)}</p>
+                </div>
+            """)
+            
     @rt("/api/feedback", methods=["POST"])
     async def api_submit_feedback(request):
         """API endpoint to submit feedback for a classification"""
@@ -3306,7 +3990,10 @@ def serve():
             ),
             cls="mb-8"
         )
-        
+
+        # Build plant-insect network visualization component
+        network_visualization = build_network_visualization(stats)
+
         # Confidence & Feedback Section
         confidence_feedback_section = Div(
             Div(
@@ -4217,6 +4904,7 @@ def serve():
                 summary_cards,
                 charts_section,
                 map_section,
+                network_visualization,
                 confidence_feedback_section,
                 tables_section,
                 rag_section,
