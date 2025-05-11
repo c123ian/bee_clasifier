@@ -44,7 +44,7 @@ HEATMAP_DIR = "/data/heatmaps"
 TEMPLATES_DIR = "/data/templates"
 
 # Claude API constants
-CLAUDE_API_KEY = "sk-xxxxxxxxxxx"
+CLAUDE_API_KEY = "sk-xxxxxxxxx"
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 # Global variables for RAG - DECLARE ALL GLOBALS HERE
@@ -839,10 +839,10 @@ def calculate_visual_similarity(query_embedding, doc_embedding):
         # Return a default similarity rather than failing
         return 0.1
 
-# Retrieve relevant documents for RAG
+# Retrieve relevant documents for RAG (network rel diagram)
 async def retrieve_relevant_documents(query, top_k=5):
     """Retrieve most relevant documents using visual embeddings similarity"""
-    global colpali_embeddings, df, page_images
+    global colpali_embeddings, df, page_images, colqwen2_model, colqwen2_processor
     
     if colpali_embeddings is None or df is None or len(df) == 0:
         logging.error("No documents or embeddings available for retrieval")
@@ -852,43 +852,63 @@ async def retrieve_relevant_documents(query, top_k=5):
     top_sources_data = []
     
     try:
-        # Initialize sentence-transformer model for query embedding
-        from sentence_transformers import SentenceTransformer, util
+        # Make sure we have ColQwen2 model and processor loaded
+        if 'colqwen2_model' not in globals() or colqwen2_model is None:
+            from colpali_engine.models import ColQwen2, ColQwen2Processor
+            
+            # Use the same model as in embedding.py
+            model_name = "vidore/colqwen2-v1.0"
+            
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logging.info(f"Loading ColQwen2 model for scoring on {device}")
+            colqwen2_model = ColQwen2.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map=device
+            ).eval()
+            colqwen2_processor = ColQwen2Processor.from_pretrained(model_name)
+            logging.info(f"Loaded ColQwen2 model for scoring")
         
-        # Create a query embedding using the text encoder
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        query_embedding = model.encode(query, convert_to_tensor=True)
+        # Process the query with ColQwen2 processor to get query embeddings
+        batch_queries = colqwen2_processor.process_queries([query]).to(colqwen2_model.device)
         
-        # Convert colpali embeddings to tensors for similarity comparison
-        document_embeddings = []
-        for emb in colpali_embeddings:
-            if isinstance(emb, np.ndarray):
-                document_embeddings.append(torch.tensor(emb))
-            elif isinstance(emb, torch.Tensor):
-                document_embeddings.append(emb)
-            else:
-                logging.warning(f"Unexpected embedding type: {type(emb)}, trying to convert to tensor")
-                try:
-                    document_embeddings.append(torch.tensor(np.array(emb)))
-                except:
-                    logging.error(f"Could not convert embedding to tensor")
-                    continue
+        # Generate query embeddings
+        with torch.no_grad():
+            query_embeddings = colqwen2_model(**batch_queries)
         
-        # Calculate similarities between query embedding and document visual embeddings
+        # Calculate similarities using a simpler approach for now
         similarities = []
-        for idx, doc_emb in enumerate(document_embeddings):
+        for idx, doc_emb in enumerate(colpali_embeddings):
             try:
-                # Ensure embeddings have compatible dimensions for comparison
-                if len(doc_emb.shape) > 1 and doc_emb.shape[0] > 1:
-                    # If document has multiple vectors, take max similarity
-                    # Reshape to match dimensions for comparison
-                    doc_emb_reshaped = doc_emb.reshape(-1, doc_emb.shape[-1])
-                    sim = util.pytorch_cos_sim(query_embedding, doc_emb_reshaped).max().item()
+                # Option 1: Use mean pooling for both embeddings to get single vectors
+                if isinstance(doc_emb, np.ndarray):
+                    doc_tensor = torch.tensor(doc_emb)
                 else:
-                    # Single vector case
-                    sim = util.pytorch_cos_sim(query_embedding, doc_emb).item()
+                    doc_tensor = doc_emb
                 
-                similarities.append((idx, sim))
+                if len(doc_tensor.shape) > 1:
+                    # Take mean across sequence dimension
+                    doc_mean = torch.mean(doc_tensor, dim=0, keepdim=True)
+                else:
+                    doc_mean = doc_tensor.unsqueeze(0)
+                
+                if len(query_embeddings.shape) > 1:
+                    query_mean = torch.mean(query_embeddings, dim=0, keepdim=True)
+                else:
+                    query_mean = query_embeddings.unsqueeze(0)
+                
+                # Normalize and calculate similarity
+                if hasattr(torch.nn.functional, 'normalize'):
+                    doc_norm = torch.nn.functional.normalize(doc_mean, p=2, dim=-1)
+                    query_norm = torch.nn.functional.normalize(query_mean, p=2, dim=-1)
+                    
+                    # Calculate cosine similarity
+                    similarity = torch.sum(query_norm * doc_norm).item()
+                else:
+                    # Fallback to a simpler approach
+                    similarity = 0.5  # Default similarity
+                
+                similarities.append((idx, similarity))
             except Exception as e:
                 logging.error(f"Error calculating similarity for document {idx}: {e}")
                 similarities.append((idx, 0.0))
@@ -1777,12 +1797,13 @@ def generate_flowbite_table_rows(results):
     timeout=600,  # Increased timeout
     volumes={DATA_DIR: bee_volume}
 )
-
+#######################
 # node network func
+#######################
 
-# Helper function to call Claude API for structured data extraction
-async def call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219"):
-    """Call Claude API to extract structured data"""
+# Make sure this is defined as a regular function at the module level
+def call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219"):
+    """Call Claude API to extract structured data (synchronous version)"""
     try:
         headers = {
             "x-api-key": CLAUDE_API_KEY,
@@ -1944,9 +1965,8 @@ async def find_plant_relationships(insect_name):
         logging.error(f"Error finding plant relationships for {insect_name}: {e}")
         return []
 
-# Extract structured plant relationships from context
 async def extract_relationships_from_context(insect, query, context_texts):
-    """Extract structured plant relationships from context using Claude API"""
+    """Extract structured plant relationships from context using direct Claude API call"""
     try:
         # Combine context texts
         combined_context = "\n\n".join(context_texts)
@@ -1981,27 +2001,77 @@ async def extract_relationships_from_context(insect, query, context_texts):
         ONLY include plants with clear relationships to {insect} from the context.
         """
         
-        # Call Claude API
-        response = await call_claude_for_structured_data(prompt, model="claude-3-7-sonnet-20250219")
-        
-        # Parse the response (assumption: response is a JSON array)
+        # Make the API call directly inside this function
         try:
-            relationships = json.loads(response)
-            if not isinstance(relationships, list):
+            headers = {
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+            
+            payload = {
+                "model": "claude-3-7-sonnet-20250219",
+                "max_tokens": 1024,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            }
+            
+            response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            response_text = result["content"][0]["text"]
+            
+            # Clean up the response text - remove any markdown formatting
+            # Handle cases where Claude returns a code block with ```json
+            clean_text = response_text.strip()
+            if clean_text.startswith("```") and "```" in clean_text[3:]:
+                # Extract content between the first set of backticks
+                clean_text = clean_text.split("```", 2)[1]
+                # Remove language identifier if present (like 'json')
+                if "\n" in clean_text:
+                    clean_text = clean_text.split("\n", 1)[1]
+                else:
+                    clean_text = clean_text.strip()
+            
+            # If it still ends with backticks, remove them
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3].strip()
+            
+            logging.info(f"Cleaned JSON response: {clean_text}")
+            
+            # Parse the cleaned response
+            try:
+                if clean_text.strip() == "[]" or not clean_text.strip():
+                    relationships = []
+                else:
+                    relationships = json.loads(clean_text)
+                    
+                if not isinstance(relationships, list):
+                    relationships = []
+            except json.JSONDecodeError as json_err:
+                logging.error(f"Error parsing JSON from Claude response: {json_err}")
+                logging.error(f"Raw response text: {response_text}")
+                logging.error(f"Cleaned text: {clean_text}")
                 relationships = []
-        except json.JSONDecodeError:
-            logging.error(f"Error parsing JSON from Claude response: {response}")
-            relationships = []
-        
-        return relationships
+            
+            return relationships
+            
+        except Exception as api_error:
+            logging.error(f"Error calling Claude API: {api_error}")
+            return []
         
     except Exception as e:
         logging.error(f"Error extracting relationships from context: {e}")
         return []
 
-# Get detailed relationship information from RAG
+# Get detailed relationship information from RAG (network diag)
 async def get_relationship_from_rag(insect, plant):
-    """Get detailed relationship information from RAG"""
+    """Get detailed relationship information from RAG with direct API call"""
     try:
         # Create a specific query about this relationship
         query = f"What is the relationship between {insect} and {plant}? How do they interact?"
@@ -2052,31 +2122,88 @@ async def get_relationship_from_rag(insect, plant):
         }}
         """
         
-        # Call Claude API
-        response = await call_claude_for_structured_data(prompt)
-        
-        # Parse the response
+        # Make the API call directly inside this function
         try:
-            relationship_data = json.loads(response)
-            if not isinstance(relationship_data, dict):
+            headers = {
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            }
+            
+            payload = {
+                "model": "claude-3-7-sonnet-20250219",
+                "max_tokens": 1024,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            }
+            
+            response = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            response_text = result["content"][0]["text"]
+            
+            # Clean up the response text - remove any markdown formatting
+            # Handle cases where Claude returns a code block with ```json
+            clean_text = response_text.strip()
+            if clean_text.startswith("```") and "```" in clean_text[3:]:
+                # Extract content between the first set of backticks
+                clean_text = clean_text.split("```", 2)[1]
+                # Remove language identifier if present (like 'json')
+                if "\n" in clean_text:
+                    clean_text = clean_text.split("\n", 1)[1]
+                else:
+                    clean_text = clean_text.strip()
+            
+            # If it still ends with backticks, remove them
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3].strip()
+            
+            logging.info(f"Cleaned JSON response for relationship details: {clean_text}")
+            
+            # Parse the cleaned response
+            try:
+                if clean_text.strip() == "{}" or not clean_text.strip():
+                    relationship_data = {
+                        "type": "unknown",
+                        "description": "No relationship information found in context."
+                    }
+                else:
+                    relationship_data = json.loads(clean_text)
+                
+                if not isinstance(relationship_data, dict):
+                    relationship_data = {
+                        "type": "unknown",
+                        "description": "Invalid relationship data format from API."
+                    }
+                
+                # Add source information if available
+                if top_sources and len(top_sources) > 0:
+                    source = top_sources[0]
+                    relationship_data["source"] = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
+                    
+            except json.JSONDecodeError as json_err:
+                logging.error(f"Error parsing JSON from Claude response: {json_err}")
+                logging.error(f"Raw response text: {response_text}")
+                logging.error(f"Cleaned text: {clean_text}")
+                
                 relationship_data = {
                     "type": "unknown",
                     "description": "Could not extract relationship details from context."
                 }
             
-            # Add source information if available
-            if top_sources and len(top_sources) > 0:
-                source = top_sources[0]
-                relationship_data["source"] = f"{source.get('filename', 'Unknown document')}, page {source.get('page', 'unknown')}"
-                
-        except json.JSONDecodeError:
-            logging.error(f"Error parsing JSON from Claude response: {response}")
-            relationship_data = {
+            return relationship_data
+            
+        except Exception as api_error:
+            logging.error(f"Error calling Claude API: {api_error}")
+            return {
                 "type": "unknown",
-                "description": "Could not extract relationship details from context."
+                "description": "Could not retrieve relationship information due to API error."
             }
-        
-        return relationship_data
         
     except Exception as e:
         logging.error(f"Error getting relationship details: {e}")
@@ -2084,6 +2211,7 @@ async def get_relationship_from_rag(insect, plant):
             "type": "unknown",
             "description": f"Error retrieving relationship information: {str(e)}"
         }
+
         
 def classify_image_claude(image_data: str, options: Dict[str, bool]) -> Dict[str, Any]:
     """
